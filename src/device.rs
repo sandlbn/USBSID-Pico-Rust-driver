@@ -769,7 +769,7 @@ impl UsbSid {
         )?;
 
         // Detach kernel driver & claim interfaces.
-        //
+        // TODO: add it to readme
         // On Linux the OS auto-attaches the cdc-acm driver to CDC devices,
         // so we must detach it before claiming.  On macOS and Windows
         // `kernel_driver_active()` returns `NotSupported` which we ignore.

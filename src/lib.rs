@@ -1,9 +1,4 @@
 //! # usbsid-pico
-//!
-//! Rust driver for the **USBSID-Pico** board – a Raspberry Pi Pico
-//! (RP2040 / RP2350) based device that lets you interface one or two
-//! MOS SID chips (or hardware SID emulators) over USB.
-//!
 //! ## Quick start
 //!
 //! ```rust,no_run

@@ -67,11 +67,3 @@ cargo build --release
 ```
 
 Link against `libusbsid_pico.so` / `.dylib` / `.dll` and use the header `usbsid_pico.h`.
-
-## Code signing
-
-See [SIGNING.md](SIGNING.md) for macOS, Windows, and Linux signing instructions.
-
-## License
-
-GPL-2.0 — see [LICENSE](LICENSE).
