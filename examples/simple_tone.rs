@@ -15,6 +15,7 @@ use std::time::Duration;
 use usbsid_pico::{ClockSpeed, UsbSid};
 
 /// SID register offsets (voice 1 starts at $D400, so offset 0x00).
+#[allow(dead_code)]
 mod sid {
     // Voice 1
     pub const V1_FREQ_LO: u8 = 0x00;
@@ -112,7 +113,7 @@ fn main() {
 
     // ── Play loop ────────────────────────────────────────────────────────
     for round in 0..4 {
-        for (i, &(hi, lo)) in notes.iter().enumerate() {
+        for (_i, &(hi, lo)) in notes.iter().enumerate() {
             // Voice 1: pulse
             let _ = us.write(sid::V1_FREQ_LO, lo);
             let _ = us.write(sid::V1_FREQ_HI, hi);

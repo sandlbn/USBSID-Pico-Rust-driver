@@ -2,12 +2,22 @@
 name = "usbsid-pico"
 version = "0.1.0"
 edition = "2021"
-authors = ["sandlbn"]
-description = "Rust driver for USBSID-Pico (RP2040/RP2350) – interface one or two MOS SID chips and/or hardware SID emulators over USB"
-license = "Apache"
+rust-version = "1.70"
+description = "Rust driver for USBSID-Pico – interface MOS SID chips (6581/8580) and hardware emulators over USB"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/sandlbn/USBSID-Pico-Rust-driver"
-keywords = ["sid", "commodore", "c64", "usb", "music"]
+homepage = "https://github.com/sandlbn/USBSID-Pico-Rust-driver"
+documentation = "https://docs.rs/usbsid-pico"
+readme = "README.md"
+keywords = ["sid", "commodore", "c64", "usb", "chiptune"]
 categories = ["hardware-support", "multimedia::audio"]
+exclude = [
+    "target/",
+    ".git/",
+    ".gitignore",
+    "*.h",
+    "cbindgen.toml",
+]
 
 [dependencies]
 rusb = "0.9.4"              # Safe libusb-1.0 bindings
@@ -21,7 +31,7 @@ mos6502 = "0.8"           # MOS 6502 CPU emulator for sid_player
 
 [features]
 default = []
-debug_memory = []         # DEBUG_USBSID_MEMORY
+debug_memory = []         # Equivalent of DEBUG_USBSID_MEMORY
 
 [[example]]
 name = "basic"
