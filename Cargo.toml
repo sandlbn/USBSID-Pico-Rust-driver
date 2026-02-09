@@ -23,14 +23,16 @@ exclude = [
 rusb = "0.9.4"              # Safe libusb-1.0 bindings
 log = "0.4"               # Logging facade
 thiserror = "2"           # Derive macro for Error trait
-
+serialport = { version = "4", optional = true }
 [dev-dependencies]
 env_logger = "0.11"       # Simple logger for examples
 libc = "0.2"              # POSIX signal handling for Ctrl+C in sid_player
 mos6502 = "0.8"           # MOS 6502 CPU emulator for sid_player
 
+
 [features]
 default = []
+serial = ["dep:serialport"]  
 debug_memory = []         # Equivalent of DEBUG_USBSID_MEMORY
 
 [[example]]

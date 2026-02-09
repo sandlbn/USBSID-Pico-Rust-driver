@@ -1,4 +1,8 @@
-//! Core driver struct
+// usbsid-pico – Rust driver for the USBSID-Pico USB SID interface.
+//
+// Licensed under MIT OR Apache-2.0
+
+//! Core driver struct and implementation.
 //!
 //! # Architecture
 //!
@@ -21,6 +25,7 @@ use rusb::{Context, DeviceHandle, UsbContext};
 use crate::constants::*;
 use crate::error::{Result, UsbSidError};
 use crate::ringbuffer::RingBuffer;
+use crate::transport::Transport;
 
 // ── Internal shared state ────────────────────────────────────────────────────
 
@@ -41,7 +46,12 @@ pub struct UsbSid {
     ctx: Option<Context>,
     handle: Option<DeviceHandle<Context>>,
 
-    // ── Buffers (mirrors the C++ static buffers) ─────────────────────────
+    // ── Transport abstraction (serial backend) ───────────────────────────
+    transport: Option<Arc<Mutex<Box<dyn Transport>>>>,
+    #[cfg(feature = "serial")]
+    use_serial: bool,
+
+    // ── Buffers ────────────────────────────────────────────────────────────
     out_buffer: Vec<u8>,
     write_buffer: Vec<u8>,
     thread_buffer: Vec<u8>,
@@ -95,6 +105,9 @@ impl UsbSid {
         Self {
             ctx: None,
             handle: None,
+            transport: None,
+            #[cfg(feature = "serial")]
+            use_serial: false,
 
             out_buffer: vec![0u8; LEN_OUT_BUFFER],
             write_buffer: vec![0u8; LEN_OUT_BUFFER],
@@ -156,7 +169,32 @@ impl UsbSid {
         debug!("[USBSID] Setup start");
         self.threaded = start_threaded;
         self.with_cycles = with_cycles;
-        self.libusb_setup()?;
+
+        // Try USB (libusb) first
+        let usb_result = self.libusb_setup();
+
+        match usb_result {
+            Ok(()) => {
+                debug!("[USBSID] USB (libusb) backend connected");
+            }
+            Err(usb_err) => {
+                // On failure, try serial backend if the feature is enabled
+                #[cfg(feature = "serial")]
+                {
+                    debug!("[USBSID] USB failed ({usb_err}), trying serial backend...");
+                    self.serial_setup().map_err(|serial_err| {
+                        error!("[USBSID] Serial also failed: {serial_err}");
+                        // Return the original USB error as it's more informative
+                        usb_err
+                    })?;
+                    debug!("[USBSID] Serial backend connected");
+                }
+                #[cfg(not(feature = "serial"))]
+                {
+                    return Err(usb_err);
+                }
+            }
+        }
 
         if self.threaded {
             self.init_thread()?;
@@ -174,13 +212,13 @@ impl UsbSid {
             return;
         }
         self.stop_thread();
-        // handle is dropped automatically via rusb when we clear it
         self.handle = None;
+        self.transport = None;
         if let Some(ctx) = self.ctx.take() {
             drop(ctx);
         }
         self.port_is_open = false;
-        debug!("[USBSID] Closed USB device");
+        debug!("[USBSID] Closed device");
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -194,7 +232,7 @@ impl UsbSid {
 
     /// `true` if a USBSID-Pico was detected on the bus during [`init`](Self::init).
     pub fn is_available(&self) -> bool {
-        self.ctx.is_some()
+        self.ctx.is_some() || self.transport.is_some()
     }
 
     /// `true` if the USB port is currently open and ready for I/O.
@@ -449,18 +487,14 @@ impl UsbSid {
         let _ = self.single_write(&buf);
 
         let mut config = [0u8; 10];
-        if let Some(h) = self.handle.as_ref() {
-            let mut actual = [0u8; 10];
-            match h.read_bulk(EP_IN_ADDR, &mut actual, Duration::from_secs(1)) {
-                Ok(n) if n == 10 => {
-                    config.copy_from_slice(&actual);
-                    if config[0] == 0x37 && config[1] == 0x7F && config[9] == 0xFF {
-                        self.socket_config_retrieved = true;
-                        return Some(config);
-                    }
+        match self.recv_bytes(&mut config) {
+            Ok(10) => {
+                if config[0] == 0x37 && config[1] == 0x7F && config[9] == 0xFF {
+                    self.socket_config_retrieved = true;
+                    return Some(config);
                 }
-                _ => {}
             }
+            _ => {}
         }
         None
     }
@@ -474,9 +508,7 @@ impl UsbSid {
         if !self.port_is_open {
             return Err(UsbSidError::PortNotOpen);
         }
-        let handle = self.handle.as_ref().ok_or(UsbSidError::PortNotOpen)?;
-        handle.write_bulk(EP_OUT_ADDR, buf, Duration::from_secs(1))?;
-        Ok(())
+        self.send_bytes(buf)
     }
 
     /// Blocking read of a single SID register.
@@ -484,21 +516,20 @@ impl UsbSid {
         if !self.port_is_open {
             return Err(UsbSidError::PortNotOpen);
         }
-        let handle = self.handle.as_ref().ok_or(UsbSidError::PortNotOpen)?;
 
         // Send read command
         let cmd = [read_header(), reg, 0];
-        handle.write_bulk(EP_OUT_ADDR, &cmd, Duration::from_secs(1))?;
+        self.send_bytes(&cmd)?;
 
         // Receive result
         let mut result = [0u8; 1];
-        match handle.read_bulk(EP_IN_ADDR, &mut result, Duration::from_secs(1)) {
+        match self.recv_bytes(&mut result) {
             Ok(_) => Ok(result[0]),
-            Err(rusb::Error::Timeout) => {
+            Err(UsbSidError::Usb(rusb::Error::Timeout)) => {
                 warn!("[USBSID] Timeout while reading register 0x{:02X}", reg);
                 Ok(0)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
@@ -507,12 +538,8 @@ impl UsbSid {
         if !self.port_is_open {
             return 0;
         }
-        let handle = match self.handle.as_ref() {
-            Some(h) => h,
-            None => return 0,
-        };
         let mut buf = vec![0u8; len];
-        match handle.read_bulk(EP_IN_ADDR, &mut buf, Duration::from_secs(1)) {
+        match self.recv_bytes(&mut buf) {
             Ok(_) => buf[0],
             Err(e) => {
                 error!("[USBSID] Error reading config: {}", e);
@@ -528,7 +555,7 @@ impl UsbSid {
     /// Write a raw buffer to the device (async, non-threaded only).
     ///
     /// This performs a synchronous bulk transfer under the hood (matching
-    /// the C++ driver's `submit + handle_events` pattern, but simpler in Rust
+    /// Simplified async write using synchronous bulk transfers.
     /// since we let `rusb` manage the transfer lifecycle).
     pub fn write_buffer(&mut self, buf: &[u8]) -> Result<()> {
         if !self.port_is_open {
@@ -537,9 +564,7 @@ impl UsbSid {
         if self.threaded {
             return Err(UsbSidError::ThreadedModeActive);
         }
-        let handle = self.handle.as_ref().ok_or(UsbSidError::PortNotOpen)?;
-        handle.write_bulk(EP_OUT_ADDR, buf, Duration::from_secs(1))?;
-        Ok(())
+        self.send_bytes(buf)
     }
 
     /// Write a single register + value pair (async, non-threaded).
@@ -581,12 +606,11 @@ impl UsbSid {
         if self.threaded {
             return Err(UsbSidError::ThreadedModeActive);
         }
-        let handle = self.handle.as_ref().ok_or(UsbSidError::PortNotOpen)?;
 
         let cmd = [read_header(), reg];
-        handle.write_bulk(EP_OUT_ADDR, &cmd, Duration::from_secs(1))?;
+        self.send_bytes(&cmd)?;
         let mut result = [0u8; 1];
-        handle.read_bulk(EP_IN_ADDR, &mut result, Duration::from_secs(1))?;
+        self.recv_bytes(&mut result)?;
         Ok(result[0])
     }
 
@@ -736,6 +760,41 @@ impl UsbSid {
     }
 
     // ═════════════════════════════════════════════════════════════════════
+    //  Private: I/O dispatch
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Send bytes to the device (USB handle or serial transport).
+    fn send_bytes(&self, data: &[u8]) -> Result<()> {
+        // Try serial transport first
+        if let Some(ref t) = self.transport {
+            let mut guard = t.lock().unwrap();
+            guard.send(data)?;
+            return Ok(());
+        }
+        // Fall back to USB handle
+        if let Some(ref h) = self.handle {
+            h.write_bulk(EP_OUT_ADDR, data, Duration::from_secs(1))?;
+            return Ok(());
+        }
+        Err(UsbSidError::PortNotOpen)
+    }
+
+    /// Receive bytes from the device (USB handle or serial transport).
+    fn recv_bytes(&self, buf: &mut [u8]) -> Result<usize> {
+        // Try serial transport first
+        if let Some(ref t) = self.transport {
+            let mut guard = t.lock().unwrap();
+            return guard.recv(buf);
+        }
+        // Fall back to USB handle
+        if let Some(ref h) = self.handle {
+            let n = h.read_bulk(EP_IN_ADDR, buf, Duration::from_secs(1))?;
+            return Ok(n);
+        }
+        Err(UsbSidError::PortNotOpen)
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
     //  Private: USB setup
     // ═════════════════════════════════════════════════════════════════════
 
@@ -769,7 +828,7 @@ impl UsbSid {
         )?;
 
         // Detach kernel driver & claim interfaces.
-        // TODO: add it to readme
+        //
         // On Linux the OS auto-attaches the cdc-acm driver to CDC devices,
         // so we must detach it before claiming.  On macOS and Windows
         // `kernel_driver_active()` returns `NotSupported` which we ignore.
@@ -816,6 +875,20 @@ impl UsbSid {
         Ok(())
     }
 
+    // ── Private: serial port setup (Windows-friendly) ────────────────────
+
+    #[cfg(feature = "serial")]
+    fn serial_setup(&mut self) -> Result<()> {
+        use crate::transport::serial::SerialTransport;
+
+        debug!("[USBSID] Attempting serial port connection");
+        let transport = SerialTransport::open_auto()?;
+        self.transport = Some(Arc::new(Mutex::new(Box::new(transport))));
+        self.use_serial = true;
+        debug!("[USBSID] Serial port connected");
+        Ok(())
+    }
+
     // ── Private: threading ───────────────────────────────────────────────
 
     fn init_thread(&mut self) -> Result<()> {
@@ -833,28 +906,32 @@ impl UsbSid {
 
         self.run_thread.store(true, Ordering::SeqCst);
         self.thread_count.fetch_add(1, Ordering::SeqCst);
-        let ctx = Context::new().map_err(|e| UsbSidError::Usb(e))?;
-        let thread_handle = ctx
-            .open_device_with_vid_pid(VENDOR_ID, PRODUCT_ID)
-            .ok_or_else(|| UsbSidError::DeviceNotFound {
-                vid: VENDOR_ID,
-                pid: PRODUCT_ID,
-            })?;
 
-        for if_num in 0..2u8 {
-            #[cfg(target_os = "linux")]
-            {
-                if thread_handle.kernel_driver_active(if_num).unwrap_or(false) {
-                    let _ = thread_handle.detach_kernel_driver(if_num);
+        // Create a transport for the writer thread.
+        let thread_transport: Box<dyn Transport> = {
+            #[cfg(feature = "serial")]
+            if self.use_serial {
+                // Serial: clone the port
+                use crate::transport::serial::SerialTransport;
+                if let Some(ref t) = self.transport {
+                    let guard = t.lock().unwrap();
+                    // Downcast isn't possible with trait objects, so we clone via
+                    // the underlying serialport try_clone. We open a fresh one instead.
+                    drop(guard);
                 }
+                Box::new(SerialTransport::open_auto()?)
+            } else {
+                // USB: open a second handle for the thread
+                use crate::transport::usb::UsbTransport;
+                Box::new(UsbTransport::open()?)
             }
-            #[cfg(target_os = "macos")]
+
+            #[cfg(not(feature = "serial"))]
             {
-                let _ = thread_handle.set_auto_detach_kernel_driver(true);
+                use crate::transport::usb::UsbTransport;
+                Box::new(UsbTransport::open()?)
             }
-            // Ignore claim errors – the main handle already owns the interfaces.
-            let _ = thread_handle.claim_interface(if_num);
-        }
+        };
 
         let run_flag = Arc::clone(&self.run_thread);
         let shared = Arc::clone(&self.shared);
@@ -865,7 +942,7 @@ impl UsbSid {
         let join = thread::Builder::new()
             .name("USBSID Thread".into())
             .spawn(move || {
-                Self::writer_thread(run_flag, shared, with_cycles, thread_handle, len_out);
+                Self::writer_thread(run_flag, shared, with_cycles, thread_transport, len_out);
                 thread_count.fetch_sub(1, Ordering::SeqCst);
             })
             .map_err(|e| UsbSidError::Thread(e.to_string()))?;
@@ -905,7 +982,7 @@ impl UsbSid {
         run: Arc<AtomicBool>,
         shared: Arc<Mutex<SharedState>>,
         with_cycles: bool,
-        handle: DeviceHandle<Context>,
+        mut transport: Box<dyn Transport>,
         len_out: usize,
     ) {
         debug!("[USBSID] Thread starting");
@@ -926,11 +1003,7 @@ impl UsbSid {
                         write_header((buffer_pos - 1) as u8)
                     };
                     out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                    let _ = handle.write_bulk(
-                        EP_OUT_ADDR,
-                        &out_buf[..buffer_pos],
-                        Duration::from_millis(100),
-                    );
+                    let _ = transport.send(&out_buf[..buffer_pos]);
                     buffer_pos = 1;
                     thread_buf.fill(0);
                     out_buf.fill(0);
@@ -956,13 +1029,10 @@ impl UsbSid {
                         thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
                         out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
                         buffer_pos = 1;
-                        // Drop lock while doing USB I/O
                         drop(locked);
-                        let _ =
-                            handle.write_bulk(EP_OUT_ADDR, &out_buf, Duration::from_millis(100));
+                        let _ = transport.send(&out_buf);
                         thread_buf.fill(0);
                         out_buf.fill(0);
-                        // Re-acquire for next iteration
                         locked = shared.lock().unwrap();
                     }
                 } else {
@@ -978,8 +1048,7 @@ impl UsbSid {
                         out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
                         buffer_pos = 1;
                         drop(locked);
-                        let _ =
-                            handle.write_bulk(EP_OUT_ADDR, &out_buf, Duration::from_millis(100));
+                        let _ = transport.send(&out_buf);
                         thread_buf.fill(0);
                         out_buf.fill(0);
                         locked = shared.lock().unwrap();
@@ -988,7 +1057,6 @@ impl UsbSid {
             }
 
             drop(locked);
-            // Small yield to avoid burning CPU when the ring is empty
             thread::sleep(Duration::from_micros(10));
         }
 

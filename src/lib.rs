@@ -36,7 +36,7 @@ pub mod device;
 pub mod error;
 pub mod ffi;
 pub mod ringbuffer;
-
+pub mod transport;
 // Re-export the most commonly used types at crate root.
 pub use constants::{sid_address, ClockSpeed, RasterRate, RefreshRate};
 pub use device::UsbSid;
