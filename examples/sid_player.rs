@@ -1,4 +1,4 @@
-// .sid file player example
+// USBSID-Pico – .sid file player example
 //
 // Parses a PSID/RSID file, loads the 6502 binary into emulated C64 memory,
 // runs the init routine, and calls the play routine at 50 Hz (PAL) or
@@ -6,7 +6,10 @@
 // via the USBSID-Pico.
 //
 // Usage:
-//   cargo run --example sid_player -- path/to/tune.sid [song_number]
+//   cargo run --example sid_player -- path/to/tune.sid [song_number] [--stereo]
+//
+// Flags:
+//   --stereo   Mirror SID writes to second SID chip (both speakers)
 //
 // Requires a connected USBSID-Pico device.
 // Download .sid files from the High Voltage SID Collection: https://hvsc.c64.org
@@ -41,7 +44,7 @@ struct SidHeader {
     play_address: u16,
     songs: u16,
     start_song: u16,
-    speed: u32,
+    _speed: u32,
     name: String,
     author: String,
     released: String,
@@ -85,7 +88,7 @@ fn parse_sid_header(data: &[u8]) -> Result<SidHeader, String> {
         play_address: read_be_u16(data, 0x0C),
         songs: read_be_u16(data, 0x0E),
         start_song: read_be_u16(data, 0x10),
-        speed: read_be_u32(data, 0x12),
+        _speed: read_be_u32(data, 0x12),
         name: read_string(data, 0x16, 32),
         author: read_string(data, 0x36, 32),
         released: read_string(data, 0x56, 32),
@@ -171,9 +174,13 @@ fn main() {
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <file.sid> [song_number]", args[0]);
+        eprintln!("Usage: {} <file.sid> [song_number] [--stereo]", args[0]);
         process::exit(1);
     }
+
+    let stereo = args.iter().any(|a| a == "--stereo");
+    // Second SID registers start at offset 0x20 on the USBSID-Pico
+    const SID2_OFFSET: u8 = 0x20;
 
     let file_data = fs::read(&args[1]).unwrap_or_else(|e| {
         eprintln!("Cannot read {}: {e}", args[1]);
@@ -185,7 +192,9 @@ fn main() {
     });
 
     let song = args
-        .get(2)
+        .iter()
+        .skip(2)
+        .find(|a| !a.starts_with("--"))
         .and_then(|s| s.parse().ok())
         .unwrap_or(header.start_song);
 
@@ -208,6 +217,10 @@ fn main() {
     println!(
         "│  Songs  : {} (#{})  Init ${:04X}  Play ${:04X}",
         header.songs, song, header.init_address, header.play_address
+    );
+    println!(
+        "│  Output : {}",
+        if stereo { "STEREO (dual SID)" } else { "MONO" }
     );
     println!("└────────────────────────────────────────────────┘");
 
@@ -252,7 +265,14 @@ fn main() {
     );
     usbsid.reset();
     thread::sleep(Duration::from_millis(50));
-    let _ = usbsid.write(0x18, 0x0F); // master volume max
+    let _ = usbsid.write(0x18, 0x0F); // SID1 master volume max
+
+    if stereo {
+        usbsid.set_stereo(1);
+        let _ = usbsid.write(SID2_OFFSET + 0x18, 0x0F); // SID2 master volume max
+    } else {
+        usbsid.set_stereo(0); // mono: route SID1 to both L+R channels
+    }
 
     // ── INIT ─────────────────────────────────────────────────────────────
     mem.install_trampoline(trampoline, header.init_address);
@@ -265,6 +285,9 @@ fn main() {
 
     for &(reg, val) in &cpu.memory.sid_writes {
         let _ = usbsid.write(reg, val);
+        if stereo && reg <= 0x18 {
+            let _ = usbsid.write(reg + SID2_OFFSET, val);
+        }
     }
     cpu.memory.clear_writes();
     println!("  Init done.");
@@ -305,8 +328,12 @@ fn main() {
 
         run_until(&mut cpu, halt_pc, 200_000);
 
+        // Forward SID writes to real hardware
         for &(reg, val) in &cpu.memory.sid_writes {
             let _ = usbsid.write(reg, val);
+            if stereo && reg <= 0x18 {
+                let _ = usbsid.write(reg + SID2_OFFSET, val);
+            }
         }
 
         let secs = t0.elapsed().as_secs();
@@ -326,6 +353,9 @@ fn main() {
 
     println!("\n\n  Stopping...");
     usbsid.mute();
+    if stereo {
+        usbsid.set_stereo(0);
+    }
     usbsid.reset();
     usbsid.close();
     println!("  Done.");

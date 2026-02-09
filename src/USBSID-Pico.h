@@ -1,15 +1,11 @@
 /*
  * USBSID-Pico Rust driver – C-compatible header
- *
- * This header mirrors USBSIDInterface.h so that existing C applications
- * can link against the Rust library as a drop-in replacement.
- *
+
  * Build the Rust crate as a C-dynamic or static library:
  *   cargo build --release
  *
  * Then link against target/release/libusbsid_pico.so (or .dylib / .lib).
  *
- * Copyright (c) 2024-2025 LouD – GPL-2.0
  */
 
 #ifndef _USBSID_PICO_H_
