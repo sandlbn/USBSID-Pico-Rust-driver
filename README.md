@@ -69,7 +69,7 @@ cargo run --example sid_player -- path/to/tune.sid
 cargo run --example sid_player -- path/to/tune.sid --stereo
 ```
 
-On macOS you may need `sudo` for USB access (see [SIGNING.md](SIGNING.md)).
+On macOS you may need `sudo` for USB access.
 
 ## Architecture
 

@@ -110,7 +110,7 @@ fn flush_writes(usbsid: &mut UsbSid, writes: &[(u8, u8)]) {
 
     for chunk in writes.chunks(max_pairs) {
         let data_len = chunk.len() * 2;
-        let mut buf = vec![0u8; 1 + data_len];
+        let mut buf = vec![0u8; USB_PACKET_SIZE]; // always full 64 bytes
         buf[0] = data_len as u8; // header: (OP_WRITE << 6) | len
         for (i, &(reg, val)) in chunk.iter().enumerate() {
             buf[1 + i * 2] = reg;
