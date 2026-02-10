@@ -414,7 +414,10 @@ fn main() {
         let r = running.clone();
         unsafe {
             RUNNING_FLAG = Some(r);
-            libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
         }
     }
 
@@ -489,7 +492,7 @@ fn main() {
         global_step += 1;
 
         // ── Evolve patterns every 4 bars ─────────────────────────────
-        if global_step % (steps as u64 * 4) == 0 {
+        if global_step.is_multiple_of(steps as u64 * 4) {
             // Mutate: randomly shift pulse count ±1 on a random voice
             let vi = rng.range(voices.len());
             let current_pulses = voices[vi].pattern.iter().filter(|&&b| b).count();

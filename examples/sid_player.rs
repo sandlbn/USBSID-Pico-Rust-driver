@@ -516,7 +516,10 @@ fn main() {
         let r = running.clone();
         unsafe {
             RUNNING_FLAG = Some(r);
-            libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
         }
     }
 
