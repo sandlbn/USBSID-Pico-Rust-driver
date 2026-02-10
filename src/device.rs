@@ -503,14 +503,11 @@ impl UsbSid {
         let _ = self.single_write(&buf);
 
         let mut config = [0u8; 10];
-        match self.recv_bytes(&mut config) {
-            Ok(10) => {
-                if config[0] == 0x37 && config[1] == 0x7F && config[9] == 0xFF {
-                    self.socket_config_retrieved = true;
-                    return Some(config);
-                }
+        if let Ok(10) = self.recv_bytes(&mut config) {
+            if config[0] == 0x37 && config[1] == 0x7F && config[9] == 0xFF {
+                self.socket_config_retrieved = true;
+                return Some(config);
             }
-            _ => {}
         }
         None
     }
@@ -638,7 +635,7 @@ impl UsbSid {
         if !self.port_is_open {
             return Err(UsbSidError::PortNotOpen);
         }
-        if !(self.threaded && !self.with_cycles) {
+        if !self.threaded || self.with_cycles {
             return Err(UsbSidError::WrongThreadMode {
                 expected_threaded: true,
                 expected_cycled: false,
@@ -765,8 +762,7 @@ impl UsbSid {
             // spin
         }
 
-        let elapsed = start.elapsed().as_nanos() as u64;
-        elapsed
+        start.elapsed().as_nanos() as u64
     }
 
     /// Reset the internal timestamp used by cycle-delay functions.

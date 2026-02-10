@@ -113,7 +113,7 @@ fn main() {
 
     // ── Play loop ────────────────────────────────────────────────────────
     for round in 0..4 {
-        for (_i, &(hi, lo)) in notes.iter().enumerate() {
+        for &(hi, lo) in notes.iter() {
             // Voice 1: pulse
             let _ = us.write(sid::V1_FREQ_LO, lo);
             let _ = us.write(sid::V1_FREQ_HI, hi);

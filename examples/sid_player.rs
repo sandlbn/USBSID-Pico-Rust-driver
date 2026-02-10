@@ -274,7 +274,7 @@ impl Bus for C64Memory {
 
         if self.mono {
             // Mono: all $D400–$D7FF → SID1 (mirrors fold every 32 bytes)
-            if address >= 0xD400 && address <= 0xD7FF {
+            if (0xD400..=0xD7FF).contains(&address) {
                 self.sid_writes.push(((address as u8) & 0x1F, value));
             }
         } else {
