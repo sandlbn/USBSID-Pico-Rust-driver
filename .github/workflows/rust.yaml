@@ -1,0 +1,29 @@
+name: Rust
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install dependencies
+      run: sudo apt-get update && sudo apt-get install -y libudev-dev
+    - name: Build
+      run: cargo build --verbose
+    - name: Build with serial
+      run: cargo build --features serial --verbose
+    - name: Check examples
+      run: cargo check --examples --features serial
+    - name: Run tests
+      run: cargo test --verbose
+    - name: Run tests with serial
+      run: cargo test --features serial --verbose
+    - name: Clippy
+      run: cargo clippy --all-targets --features serial -- -D warnings
+    - name: Doc
+      run: cargo doc --no-deps --features serial
