@@ -109,8 +109,7 @@ impl Scale {
 /// where f is the desired frequency in Hz.
 fn midi_to_sid_freq(midi_note: u8) -> u16 {
     let freq_hz = 440.0 * f64::powf(2.0, (midi_note as f64 - 69.0) / 12.0);
-    let sid_val = (freq_hz * 16777216.0 / 985248.0) as u16;
-    sid_val
+    (freq_hz * 16777216.0 / 985248.0) as u16
 }
 
 /// Convert a note name like "C3", "A#4", "Eb2" to MIDI number.
@@ -132,17 +131,17 @@ fn note_name_to_midi(s: &str) -> Option<u8> {
         _ => return None,
     };
 
-    let (accidental, octave_str) = if rest.starts_with('#') {
-        (1i8, &rest[1..])
-    } else if rest.starts_with('b') {
-        (-1i8, &rest[1..])
+    let (accidental, octave_str) = if let Some(stripped) = rest.strip_prefix('#') {
+        (1i8, stripped)
+    } else if let Some(stripped) = rest.strip_prefix('b') {
+        (-1i8, stripped)
     } else {
         (0i8, rest)
     };
 
     let octave: i8 = octave_str.parse().ok()?;
     let midi = (octave + 1) as i16 * 12 + note_base as i16 + accidental as i16;
-    if midi >= 0 && midi <= 127 {
+    if (0..=127).contains(&midi) {
         Some(midi as u8)
     } else {
         None
@@ -312,7 +311,7 @@ fn main() {
     // Voice 1: lead – medium density, mid octave, pulse
     // Voice 2: perc – dense/noisy, high octave, noise
 
-    let mut voices = vec![
+    let mut voices = [
         VoiceConfig {
             pattern: euclidean(steps, pulses_v1.min(steps)),
             step: 0,
@@ -415,7 +414,10 @@ fn main() {
         let r = running.clone();
         unsafe {
             RUNNING_FLAG = Some(r);
-            libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
         }
     }
 
@@ -490,7 +492,7 @@ fn main() {
         global_step += 1;
 
         // ── Evolve patterns every 4 bars ─────────────────────────────
-        if global_step % (steps as u64 * 4) == 0 {
+        if global_step.is_multiple_of(steps as u64 * 4) {
             // Mutate: randomly shift pulse count ±1 on a random voice
             let vi = rng.range(voices.len());
             let current_pulses = voices[vi].pattern.iter().filter(|&&b| b).count();

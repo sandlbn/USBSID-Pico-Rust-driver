@@ -68,11 +68,7 @@ impl RingBuffer {
 
     /// Absolute distance between read and write cursors.
     pub fn diff(&self) -> usize {
-        if self.read_pos < self.write_pos {
-            self.write_pos - self.read_pos
-        } else {
-            self.read_pos - self.write_pos
-        }
+        self.write_pos.abs_diff(self.read_pos)
     }
 
     // ── Mutation ──────────────────────────────────────────────────────────

@@ -45,6 +45,10 @@ pub extern "C" fn create_USBSID() -> USBSIDitf {
 }
 
 /// Initialise the driver.  Returns 0 on success, -1 on failure.
+///
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`] and must not be used concurrently.
 #[no_mangle]
 pub unsafe extern "C" fn init_USBSID(p: USBSIDitf, start_threaded: bool, with_cycles: bool) -> i32 {
     match as_mut(p) {
@@ -57,6 +61,10 @@ pub unsafe extern "C" fn init_USBSID(p: USBSIDitf, start_threaded: bool, with_cy
 }
 
 /// Close the driver and free the heap allocation.
+///
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`]. Must not be called more than once for the same pointer.
 #[no_mangle]
 pub unsafe extern "C" fn close_USBSID(p: USBSIDitf) {
     if !p.is_null() {
@@ -66,6 +74,9 @@ pub unsafe extern "C" fn close_USBSID(p: USBSIDitf) {
 
 // ── SID / device control ─────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn pause_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -73,6 +84,9 @@ pub unsafe extern "C" fn pause_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn reset_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -80,6 +94,9 @@ pub unsafe extern "C" fn reset_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn resetallregisters_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -87,6 +104,9 @@ pub unsafe extern "C" fn resetallregisters_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn clearbus_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -94,6 +114,9 @@ pub unsafe extern "C" fn clearbus_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn mute_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -101,6 +124,9 @@ pub unsafe extern "C" fn mute_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn unmute_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -110,6 +136,9 @@ pub unsafe extern "C" fn unmute_USBSID(p: USBSIDitf) {
 
 // ── Clock rate ───────────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn setclockrate_USBSID(
     p: USBSIDitf,
@@ -121,6 +150,9 @@ pub unsafe extern "C" fn setclockrate_USBSID(
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getclockrate_USBSID(p: USBSIDitf) -> i64 {
     match as_mut(p) {
@@ -129,6 +161,9 @@ pub unsafe extern "C" fn getclockrate_USBSID(p: USBSIDitf) -> i64 {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getrefreshrate_USBSID(p: USBSIDitf) -> i64 {
     match as_ref(p) {
@@ -137,6 +172,9 @@ pub unsafe extern "C" fn getrefreshrate_USBSID(p: USBSIDitf) -> i64 {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getrasterrate_USBSID(p: USBSIDitf) -> i64 {
     match as_ref(p) {
@@ -147,6 +185,9 @@ pub unsafe extern "C" fn getrasterrate_USBSID(p: USBSIDitf) -> i64 {
 
 // ── Device info ──────────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getnumsids_USBSID(p: USBSIDitf) -> i32 {
     match as_mut(p) {
@@ -155,6 +196,9 @@ pub unsafe extern "C" fn getnumsids_USBSID(p: USBSIDitf) -> i32 {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getfmoplsid_USBSID(p: USBSIDitf) -> i32 {
     match as_mut(p) {
@@ -163,6 +207,9 @@ pub unsafe extern "C" fn getfmoplsid_USBSID(p: USBSIDitf) -> i32 {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn getpcbversion_USBSID(p: USBSIDitf) -> i32 {
     match as_mut(p) {
@@ -171,6 +218,9 @@ pub unsafe extern "C" fn getpcbversion_USBSID(p: USBSIDitf) -> i32 {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn setstereo_USBSID(p: USBSIDitf, state: i32) {
     if let Some(us) = as_mut(p) {
@@ -178,6 +228,9 @@ pub unsafe extern "C" fn setstereo_USBSID(p: USBSIDitf, state: i32) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn togglestereo_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -187,23 +240,35 @@ pub unsafe extern "C" fn togglestereo_USBSID(p: USBSIDitf) {
 
 // ── Status helpers ───────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn initialised_USBSID(p: USBSIDitf) -> bool {
-    as_ref(p).map_or(false, |us| us.is_initialised())
+    as_ref(p).is_some_and(|us| us.is_initialised())
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn available_USBSID(p: USBSIDitf) -> bool {
-    as_ref(p).map_or(false, |us| us.is_available())
+    as_ref(p).is_some_and(|us| us.is_available())
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn portisopen_USBSID(p: USBSIDitf) -> bool {
-    as_ref(p).map_or(false, |us| us.is_open())
+    as_ref(p).is_some_and(|us| us.is_open())
 }
 
 // ── Synchronous I/O ──────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`]. `buff` must point to at least `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn writesingle_USBSID(p: USBSIDitf, buff: *const u8, len: i32) {
     if let Some(us) = as_ref(p) {
@@ -214,6 +279,9 @@ pub unsafe extern "C" fn writesingle_USBSID(p: USBSIDitf, buff: *const u8, len: 
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn readsingle_USBSID(p: USBSIDitf, reg: u8) -> u8 {
     match as_ref(p) {
@@ -224,6 +292,9 @@ pub unsafe extern "C" fn readsingle_USBSID(p: USBSIDitf, reg: u8) -> u8 {
 
 // ── Asynchronous direct I/O ──────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`]. `buff` must point to at least `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn writebuffer_USBSID(p: USBSIDitf, buff: *const u8, len: i32) {
     if let Some(us) = as_mut(p) {
@@ -234,6 +305,9 @@ pub unsafe extern "C" fn writebuffer_USBSID(p: USBSIDitf, buff: *const u8, len: 
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn write_USBSID(p: USBSIDitf, reg: u8, val: u8) {
     if let Some(us) = as_mut(p) {
@@ -241,6 +315,9 @@ pub unsafe extern "C" fn write_USBSID(p: USBSIDitf, reg: u8, val: u8) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn writecycled_USBSID(p: USBSIDitf, reg: u8, val: u8, cycles: u16) {
     if let Some(us) = as_mut(p) {
@@ -248,6 +325,9 @@ pub unsafe extern "C" fn writecycled_USBSID(p: USBSIDitf, reg: u8, val: u8, cycl
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn read_USBSID(p: USBSIDitf, reg: u8) -> u8 {
     match as_mut(p) {
@@ -258,6 +338,9 @@ pub unsafe extern "C" fn read_USBSID(p: USBSIDitf, reg: u8) -> u8 {
 
 // ── Ring-buffer writes ───────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn writering_USBSID(p: USBSIDitf, reg: u8, val: u8) {
     if let Some(us) = as_ref(p) {
@@ -265,6 +348,9 @@ pub unsafe extern "C" fn writering_USBSID(p: USBSIDitf, reg: u8, val: u8) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn writeringcycled_USBSID(p: USBSIDitf, reg: u8, val: u8, cycles: u16) {
     if let Some(us) = as_ref(p) {
@@ -274,6 +360,9 @@ pub unsafe extern "C" fn writeringcycled_USBSID(p: USBSIDitf, reg: u8, val: u8, 
 
 // ── Thread management ────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn enablethread_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -281,6 +370,9 @@ pub unsafe extern "C" fn enablethread_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn disablethread_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -288,6 +380,9 @@ pub unsafe extern "C" fn disablethread_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn setflush_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -295,6 +390,9 @@ pub unsafe extern "C" fn setflush_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn flush_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -302,6 +400,9 @@ pub unsafe extern "C" fn flush_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn restartringbuffer_USBSID(p: USBSIDitf) {
     if let Some(us) = as_mut(p) {
@@ -309,6 +410,9 @@ pub unsafe extern "C" fn restartringbuffer_USBSID(p: USBSIDitf) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn setbuffsize_USBSID(p: USBSIDitf, size: i32) {
     if let Some(us) = as_mut(p) {
@@ -316,6 +420,9 @@ pub unsafe extern "C" fn setbuffsize_USBSID(p: USBSIDitf, size: i32) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn setdiffsize_USBSID(p: USBSIDitf, size: i32) {
     if let Some(us) = as_mut(p) {
@@ -323,6 +430,9 @@ pub unsafe extern "C" fn setdiffsize_USBSID(p: USBSIDitf, size: i32) {
     }
 }
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn restartthread_USBSID(p: USBSIDitf, with_cycles: bool) {
     if let Some(us) = as_mut(p) {
@@ -332,6 +442,9 @@ pub unsafe extern "C" fn restartthread_USBSID(p: USBSIDitf, with_cycles: bool) {
 
 // ── Timing ───────────────────────────────────────────────────────────────────
 
+/// # Safety
+///
+/// `p` must be a valid pointer returned by [`create_USBSID`].
 #[no_mangle]
 pub unsafe extern "C" fn waitforcycle_USBSID(p: USBSIDitf, cycles: u64) -> i64 {
     match as_mut(p) {
