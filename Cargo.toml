@@ -46,3 +46,7 @@ path = "examples/simple_tone.rs"
 [[example]]
 name = "sid_player"
 path = "examples/sid_player.rs"
+
+[[example]]
+name = "generative"
+path = "examples/generative.rs"
