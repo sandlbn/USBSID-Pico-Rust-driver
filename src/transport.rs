@@ -36,6 +36,7 @@ pub(crate) trait Transport: Send {
 //  libusb backend (Linux, macOS, or explicit)
 // ─────────────────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "usb")]
 pub(crate) mod usb {
     use super::*;
     use rusb::{Context, DeviceHandle, UsbContext};
@@ -44,7 +45,7 @@ pub(crate) mod usb {
     pub struct UsbTransport {
         pub handle: DeviceHandle<Context>,
         #[allow(dead_code)]
-        pub ctx: Context,
+        ctx: Context, // kept alive to prevent libusb context from being dropped
     }
 
     impl UsbTransport {

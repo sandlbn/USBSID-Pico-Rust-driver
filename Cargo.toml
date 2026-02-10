@@ -1,6 +1,6 @@
 [package]
 name = "usbsid-pico"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.70"
 description = "Rust driver for USBSID-Pico – interface MOS SID chips (6581/8580) and hardware emulators over USB"
@@ -20,10 +20,11 @@ exclude = [
 ]
 
 [dependencies]
-rusb = "0.9.4"              # Safe libusb-1.0 bindings
 log = "0.4"               # Logging facade
 thiserror = "2"           # Derive macro for Error trait
 serialport = { version = "4", optional = true }
+rusb = { version = "0.9", optional = true }
+
 [dev-dependencies]
 env_logger = "0.11"       # Simple logger for examples
 libc = "0.2"              # POSIX signal handling for Ctrl+C in sid_player
@@ -32,7 +33,8 @@ mos6502 = "0.8"           # MOS 6502 CPU emulator for sid_player
 
 [features]
 default = []
-serial = ["dep:serialport"]  
+serial = ["dep:serialport"] # default
+usb = ["dep:rusb"]
 debug_memory = []         # Equivalent of DEBUG_USBSID_MEMORY
 
 [[example]]

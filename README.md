@@ -4,62 +4,44 @@
 [![Documentation](https://docs.rs/usbsid-pico/badge.svg)](https://docs.rs/usbsid-pico)
 [![License](https://img.shields.io/crates/l/usbsid-pico.svg)](LICENSE-MIT)
 
-Rust driver for the **[USBSID-Pico](https://github.com/LouDnl/USBSID-Pico)** board — a
-Raspberry Pi Pico (RP2040 / RP2350) based device for interfacing one or more
+Rust driver for the **[USBSID-Pico](https://github.com/LouDnl/USBSID-Pico)** — a
+Raspberry Pi Pico (RP2040 / RP2350) based board for interfacing one or more
 MOS SID chips (6581/8580) and hardware SID emulators over USB.
 
-## Features
-
-- Synchronous and asynchronous (threaded) write modes
-- Ring-buffer backed background writer for low-latency streaming
-- Cycle-accurate writes for emulator integration
-- Up to 4 SID chips (stereo / 3SID / 4SID)
-- Clock rate configuration (PAL / NTSC)
-- C FFI layer for integration with existing C/C++ applications
-- Cross-platform: Linux, macOS, Windows
+This is a Rust implementation of the [original C++ driver](https://github.com/LouDnl/USBSID-Pico-driver)
+by [LouDnl](https://github.com/LouDnl). The original driver uses libusb;
+this crate defaults to serial port communication instead, which avoids
+platform-specific USB driver setup.
 
 ## Requirements
 
-- **Rust 1.70+** (2021 edition)
-- **libusb 1.0** development headers (not needed when using the `serial` feature):
+- Rust 1.70+ (2021 edition)
+- A connected USBSID-Pico device
+- On Linux: `libudev-dev` for serial port enumeration
+  ```bash
+  sudo apt install libudev-dev   # Debian/Ubuntu
+  sudo dnf install systemd-devel # Fedora
+  ```
 
-| Platform | Install |
-|----------|---------|
-| Debian/Ubuntu | `sudo apt install libusb-1.0-0-dev` |
-| Fedora | `sudo dnf install libusb1-devel` |
-| macOS | `brew install libusb` |
-| Windows | Not needed with `--features serial` (recommended) |
-
-## Platform notes
-
-### Linux
-
-Works out of the box with libusb. You may need a udev rule for non-root access:
+## Building
 
 ```bash
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="cafe", ATTR{idProduct}=="4011", MODE="0666"' | \
-  sudo tee /etc/udev/rules.d/99-usbsid.rules
-sudo udevadm control --reload-rules
+cargo build --release
 ```
 
-### macOS
+The default `serial` feature uses the OS-provided COM / tty port — no
+additional drivers or libraries are needed on any platform.
 
-Requires `brew install libusb` and may need `sudo` for USB access.
-See [SIGNING.md](SIGNING.md) for code signing to avoid `sudo`.
-
-### Windows
-
-libusb on Windows requires a WinUSB driver (via [Zadig](https://zadig.akeo.ie/)),
-which replaces the default COM port driver. To avoid this, use the **serial backend**
-instead — it talks to the USBSID-Pico through the COM port that Windows assigns
-automatically, with no driver changes needed:
+If you want the libusb backend instead (matching the original C++ driver),
+enable the `usb` feature. This requires libusb 1.0 headers and on Windows
+a WinUSB driver via [Zadig](https://zadig.akeo.ie/):
 
 ```bash
-cargo build --features serial
+cargo build --features usb
 ```
 
-When `serial` is enabled, the driver tries libusb first and automatically falls back
-to the serial port if libusb fails. This means the same binary works on all platforms.
+When both features are enabled, the driver tries USB first and falls back
+to serial.
 
 ## Quick start
 
@@ -73,90 +55,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Write to SID register via the ring buffer
     sid.write_ring_cycled(0x01, 0x01, 0xFFFF)?;
 
-    // Read a register (synchronous)
+    // Read a register
     let val = sid.single_read(0x1B)?;
     println!("OSC3 random: 0x{:02X}", val);
 
-    // Automatically closed on drop
     Ok(())
 }
 ```
 
 ## Examples
 
-Run with a connected USBSID-Pico:
-
 ```bash
-# Simple register test
 cargo run --example basic
-
-# Generate a tone
 cargo run --example simple_tone
-
-# Play a .sid file (mono)
 cargo run --example sid_player -- path/to/tune.sid
-
-# Play a .sid file (2SID/3SID auto-detected from header)
-cargo run --example sid_player -- path/to/tune.sid
-
-# Mirror mono tune to both SID chips
 cargo run --example sid_player -- path/to/tune.sid --stereo
-
-# 4SID with manual SID4 address
 cargo run --example sid_player -- path/to/tune.sid --sid4 $DE00
 ```
 
-On Windows, add `--features serial` to any of the above:
+The `sid_player` example includes a 6502 CPU emulator and supports
+PSID/RSID v1–v4 files with automatic multi-SID detection from the header.
 
-```bash
-cargo run --features serial --example sid_player -- path/to/tune.sid
-```
-
-## Cargo features
+## Features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `serial` | No | Enables serial port backend (requires `serialport` crate). Recommended for Windows. Also works on macOS (`/dev/tty.usbmodem*`) and Linux (`/dev/ttyACM*`). |
-| `debug_memory` | No | Enable SID memory tracking for debugging. |
+| `serial` | Yes | Serial port backend via `serialport`. No driver setup needed. |
+| `usb` | No | libusb backend via `rusb`. Matches original C++ driver. Needs libusb headers and on Windows a WinUSB driver. |
+| `debug_memory` | No | SID memory tracking. |
 
 ## Architecture
 
 | Module | Description |
 |--------|-------------|
+| `device` | Core `UsbSid` struct — connection setup, I/O, threading, timing |
+| `transport` | Transport trait with serial and libusb backends |
 | `constants` | Protocol opcodes, USB IDs, clock/timing tables, SID address helpers |
-| `device` | Core `UsbSid` struct — USB setup, I/O, threading, timing |
-| `transport` | Transport abstraction: libusb and serial port backends |
-| `ringbuffer` | Lock-free SPSC ring buffer for the writer thread |
+| `ringbuffer` | Lock-free SPSC ring buffer for the background writer thread |
 | `error` | `UsbSidError` enum and `Result` alias |
 | `ffi` | `extern "C"` functions for C/C++ consumers |
 
-### Transport backends
-
-The driver abstracts I/O through a `Transport` trait with two implementations:
-
-| Backend | When used | Dependency |
-|---------|-----------|------------|
-| **USB** (libusb) | Default on all platforms | `rusb` (always included) |
-| **Serial** (COM port) | Fallback when libusb fails and `serial` feature is enabled | `serialport` (optional) |
-
-The `init()` method tries libusb first. If it fails and the `serial` feature is compiled in,
-it automatically scans for a USBSID-Pico on available serial ports (matching VID `0xCAFE` /
-PID `0x4011`) and connects through the COM port. No code changes needed — just enable the feature.
-
 ### Write modes
 
-| Mode | Function | Use case |
-|------|----------|----------|
-| Synchronous | `single_write` / `single_read` | Direct bulk transfers |
-| Async direct | `write` / `write_cycled` | Non-threaded bulk writes |
+| Mode | Function | Description |
+|------|----------|-------------|
+| Synchronous | `single_write` / `single_read` | Blocking transfers |
+| Async direct | `write` / `write_cycled` | Non-threaded writes |
 | Async threaded | `write_ring` / `write_ring_cycled` | Background thread drains ring buffer |
 
-### USBSID-Pico register layout
+### SID register layout
 
-Each SID chip occupies 32 registers (`0x20` bytes):
+Each SID occupies 32 registers (`0x20` bytes):
 
-| SID | USBSID registers |
-|-----|-----------------|
+| SID | Registers |
+|-----|-----------|
 | SID1 | `$00–$1F` |
 | SID2 | `$20–$3F` |
 | SID3 | `$40–$5F` |
@@ -166,22 +118,33 @@ Each SID chip occupies 32 registers (`0x20` bytes):
 
 The crate exposes a C-compatible interface. Build as a shared library:
 
-```toml
-[lib]
-crate-type = ["cdylib", "rlib"]
-```
-
 ```bash
 cargo build --release
 # → target/release/libusbsid_pico.{so,dylib,dll}
 ```
 
-To auto-generate the C header:
+Generate the C header with cbindgen:
 
 ```bash
 cargo install cbindgen
 cbindgen --config cbindgen.toml --crate usbsid-pico --output usbsid_pico.h
 ```
+
+## Platform notes
+
+**Linux** — You may need a udev rule for non-root access:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="cafe", ATTR{idProduct}=="4011", MODE="0666"' | \
+  sudo tee /etc/udev/rules.d/99-usbsid.rules
+sudo udevadm control --reload-rules
+```
+
+**macOS** — With the default serial backend no special setup is needed.
+
+**Windows** — The default serial backend uses the COM port that Windows
+assigns automatically. If using the `usb` feature you need to install a
+WinUSB driver with [Zadig](https://zadig.akeo.ie/).
 
 ## License
 
@@ -192,14 +155,7 @@ Licensed under either of
 
 at your option.
 
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted
-for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
-be dual licensed as above, without any additional terms or conditions.
-
 ## Acknowledgments
 
-The [USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware and firmware
-are created by [LouDnl](https://github.com/LouDnl). This driver is an independent
-implementation targeting the USBSID-Pico USB protocol.
+[USBSID-Pico](https://github.com/LouDnl/USBSID-Pico) hardware and firmware
+by [LouDnl](https://github.com/LouDnl).

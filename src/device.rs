@@ -20,6 +20,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, warn};
+#[cfg(feature = "usb")]
 use rusb::{Context, DeviceHandle, UsbContext};
 
 use crate::constants::*;
@@ -39,11 +40,13 @@ struct SharedState {
 
 /// Handle to a single USBSID-Pico device.
 ///
-/// Create with [`UsbSid::new`] and then call [`UsbSid::init`] to open the USB
+/// Create with [`UsbSid::new`] and then call [`UsbSid::init`] to open the
 /// connection and optionally start the background writer thread.
 pub struct UsbSid {
-    // ── USB ──────────────────────────────────────────────────────────────
+    // ── USB (libusb, only with "usb" feature) ────────────────────────────
+    #[cfg(feature = "usb")]
     ctx: Option<Context>,
+    #[cfg(feature = "usb")]
     handle: Option<DeviceHandle<Context>>,
 
     // ── Transport abstraction (serial backend) ───────────────────────────
@@ -103,7 +106,9 @@ impl UsbSid {
     pub fn new() -> Self {
         debug!("[USBSID] Driver init start");
         Self {
+            #[cfg(feature = "usb")]
             ctx: None,
+            #[cfg(feature = "usb")]
             handle: None,
             transport: None,
             #[cfg(feature = "serial")]
@@ -170,40 +175,44 @@ impl UsbSid {
         self.threaded = start_threaded;
         self.with_cycles = with_cycles;
 
-        // Try USB (libusb) first
-        let usb_result = self.libusb_setup();
-
-        match usb_result {
+        // Try available backends. USB first (if enabled), then serial (default).
+        #[cfg(feature = "usb")]
+        match self.libusb_setup() {
             Ok(()) => {
                 debug!("[USBSID] USB (libusb) backend connected");
+                // Skip serial setup below
+                if self.threaded {
+                    self.init_thread()?;
+                }
+                let _ = self.get_clock_rate();
+                self.port_is_open = true;
+                return Ok(());
             }
-            Err(usb_err) => {
-                // On failure, try serial backend if the feature is enabled
-                #[cfg(feature = "serial")]
-                {
-                    debug!("[USBSID] USB failed ({usb_err}), trying serial backend...");
-                    self.serial_setup().map_err(|serial_err| {
-                        error!("[USBSID] Serial also failed: {serial_err}");
-                        // Return the original USB error as it's more informative
-                        usb_err
-                    })?;
-                    debug!("[USBSID] Serial backend connected");
-                }
-                #[cfg(not(feature = "serial"))]
-                {
-                    return Err(usb_err);
-                }
+            Err(e) => {
+                debug!("[USBSID] USB failed: {e}");
             }
         }
 
-        if self.threaded {
-            self.init_thread()?;
+        #[cfg(feature = "serial")]
+        match self.serial_setup() {
+            Ok(()) => {
+                debug!("[USBSID] Serial backend connected");
+                if self.threaded {
+                    self.init_thread()?;
+                }
+                let _ = self.get_clock_rate();
+                self.port_is_open = true;
+                return Ok(());
+            }
+            Err(e) => {
+                debug!("[USBSID] Serial failed: {e}");
+            }
         }
 
-        // Retrieve clock rate once on init
-        let _ = self.get_clock_rate();
-        self.port_is_open = true;
-        Ok(())
+        Err(UsbSidError::DeviceNotFound {
+            vid: VENDOR_ID,
+            pid: PRODUCT_ID,
+        })
     }
 
     /// Close the USB connection, stop the writer thread, and release all resources.
@@ -212,11 +221,14 @@ impl UsbSid {
             return;
         }
         self.stop_thread();
-        self.handle = None;
-        self.transport = None;
-        if let Some(ctx) = self.ctx.take() {
-            drop(ctx);
+        #[cfg(feature = "usb")]
+        {
+            self.handle = None;
+            if let Some(ctx) = self.ctx.take() {
+                drop(ctx);
+            }
         }
+        self.transport = None;
         self.port_is_open = false;
         debug!("[USBSID] Closed device");
     }
@@ -232,7 +244,11 @@ impl UsbSid {
 
     /// `true` if a USBSID-Pico was detected on the bus during [`init`](Self::init).
     pub fn is_available(&self) -> bool {
-        self.ctx.is_some() || self.transport.is_some()
+        #[cfg(feature = "usb")]
+        if self.ctx.is_some() {
+            return true;
+        }
+        self.transport.is_some()
     }
 
     /// `true` if the USB port is currently open and ready for I/O.
@@ -525,11 +541,10 @@ impl UsbSid {
         let mut result = [0u8; 1];
         match self.recv_bytes(&mut result) {
             Ok(_) => Ok(result[0]),
-            Err(UsbSidError::Usb(rusb::Error::Timeout)) => {
-                warn!("[USBSID] Timeout while reading register 0x{:02X}", reg);
+            Err(e) => {
+                warn!("[USBSID] Error reading register 0x{:02X}: {e}", reg);
                 Ok(0)
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -772,6 +787,7 @@ impl UsbSid {
             return Ok(());
         }
         // Fall back to USB handle
+        #[cfg(feature = "usb")]
         if let Some(ref h) = self.handle {
             h.write_bulk(EP_OUT_ADDR, data, Duration::from_secs(1))?;
             return Ok(());
@@ -787,6 +803,7 @@ impl UsbSid {
             return guard.recv(buf);
         }
         // Fall back to USB handle
+        #[cfg(feature = "usb")]
         if let Some(ref h) = self.handle {
             let n = h.read_bulk(EP_IN_ADDR, buf, Duration::from_secs(1))?;
             return Ok(n);
@@ -798,6 +815,7 @@ impl UsbSid {
     //  Private: USB setup
     // ═════════════════════════════════════════════════════════════════════
 
+    #[cfg(feature = "usb")]
     fn libusb_setup(&mut self) -> Result<()> {
         let ctx = Context::new()?;
 
@@ -891,6 +909,24 @@ impl UsbSid {
 
     // ── Private: threading ───────────────────────────────────────────────
 
+    /// Create a fresh transport for the writer thread.
+    fn create_thread_transport(&self) -> Result<Box<dyn Transport>> {
+        #[cfg(feature = "serial")]
+        if self.use_serial {
+            use crate::transport::serial::SerialTransport;
+            return Ok(Box::new(SerialTransport::open_auto()?));
+        }
+
+        #[cfg(feature = "usb")]
+        {
+            use crate::transport::usb::UsbTransport;
+            return Ok(Box::new(UsbTransport::open()?));
+        }
+
+        #[allow(unreachable_code)]
+        Err(UsbSidError::PortNotOpen)
+    }
+
     fn init_thread(&mut self) -> Result<()> {
         debug!("[USBSID] Init Thread start");
         self.buffer_pos = 1;
@@ -908,30 +944,7 @@ impl UsbSid {
         self.thread_count.fetch_add(1, Ordering::SeqCst);
 
         // Create a transport for the writer thread.
-        let thread_transport: Box<dyn Transport> = {
-            #[cfg(feature = "serial")]
-            if self.use_serial {
-                // Serial: clone the port
-                use crate::transport::serial::SerialTransport;
-                if let Some(ref t) = self.transport {
-                    let guard = t.lock().unwrap();
-                    // Downcast isn't possible with trait objects, so we clone via
-                    // the underlying serialport try_clone. We open a fresh one instead.
-                    drop(guard);
-                }
-                Box::new(SerialTransport::open_auto()?)
-            } else {
-                // USB: open a second handle for the thread
-                use crate::transport::usb::UsbTransport;
-                Box::new(UsbTransport::open()?)
-            }
-
-            #[cfg(not(feature = "serial"))]
-            {
-                use crate::transport::usb::UsbTransport;
-                Box::new(UsbTransport::open()?)
-            }
-        };
+        let thread_transport = self.create_thread_transport()?;
 
         let run_flag = Arc::clone(&self.run_thread);
         let shared = Arc::clone(&self.shared);
