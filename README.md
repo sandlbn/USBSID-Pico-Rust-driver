@@ -21,14 +21,45 @@ MOS SID chips (6581/8580) and hardware SID emulators over USB.
 ## Requirements
 
 - **Rust 1.70+** (2021 edition)
-- **libusb 1.0** development headers:
+- **libusb 1.0** development headers (not needed when using the `serial` feature):
 
 | Platform | Install |
 |----------|---------|
 | Debian/Ubuntu | `sudo apt install libusb-1.0-0-dev` |
 | Fedora | `sudo dnf install libusb1-devel` |
 | macOS | `brew install libusb` |
-| Windows | [vcpkg](https://github.com/microsoft/vcpkg) or pre-built libs |
+| Windows | Not needed with `--features serial` (recommended) |
+
+## Platform notes
+
+### Linux
+
+Works out of the box with libusb. You may need a udev rule for non-root access:
+
+```bash
+echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="cafe", ATTR{idProduct}=="4011", MODE="0666"' | \
+  sudo tee /etc/udev/rules.d/99-usbsid.rules
+sudo udevadm control --reload-rules
+```
+
+### macOS
+
+Requires `brew install libusb` and may need `sudo` for USB access.
+See [SIGNING.md](SIGNING.md) for code signing to avoid `sudo`.
+
+### Windows
+
+libusb on Windows requires a WinUSB driver (via [Zadig](https://zadig.akeo.ie/)),
+which replaces the default COM port driver. To avoid this, use the **serial backend**
+instead — it talks to the USBSID-Pico through the COM port that Windows assigns
+automatically, with no driver changes needed:
+
+```bash
+cargo build --features serial
+```
+
+When `serial` is enabled, the driver tries libusb first and automatically falls back
+to the serial port if libusb fails. This means the same binary works on all platforms.
 
 ## Quick start
 
@@ -65,11 +96,28 @@ cargo run --example simple_tone
 # Play a .sid file (mono)
 cargo run --example sid_player -- path/to/tune.sid
 
-# Play a .sid file (2SID/3SID auto-detected, or force stereo mirror)
+# Play a .sid file (2SID/3SID auto-detected from header)
+cargo run --example sid_player -- path/to/tune.sid
+
+# Mirror mono tune to both SID chips
 cargo run --example sid_player -- path/to/tune.sid --stereo
+
+# 4SID with manual SID4 address
+cargo run --example sid_player -- path/to/tune.sid --sid4 $DE00
 ```
 
-On macOS you may need `sudo` for USB access.
+On Windows, add `--features serial` to any of the above:
+
+```bash
+cargo run --features serial --example sid_player -- path/to/tune.sid
+```
+
+## Cargo features
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `serial` | No | Enables serial port backend (requires `serialport` crate). Recommended for Windows. Also works on macOS (`/dev/tty.usbmodem*`) and Linux (`/dev/ttyACM*`). |
+| `debug_memory` | No | Enable SID memory tracking for debugging. |
 
 ## Architecture
 
@@ -77,9 +125,23 @@ On macOS you may need `sudo` for USB access.
 |--------|-------------|
 | `constants` | Protocol opcodes, USB IDs, clock/timing tables, SID address helpers |
 | `device` | Core `UsbSid` struct — USB setup, I/O, threading, timing |
+| `transport` | Transport abstraction: libusb and serial port backends |
 | `ringbuffer` | Lock-free SPSC ring buffer for the writer thread |
 | `error` | `UsbSidError` enum and `Result` alias |
 | `ffi` | `extern "C"` functions for C/C++ consumers |
+
+### Transport backends
+
+The driver abstracts I/O through a `Transport` trait with two implementations:
+
+| Backend | When used | Dependency |
+|---------|-----------|------------|
+| **USB** (libusb) | Default on all platforms | `rusb` (always included) |
+| **Serial** (COM port) | Fallback when libusb fails and `serial` feature is enabled | `serialport` (optional) |
+
+The `init()` method tries libusb first. If it fails and the `serial` feature is compiled in,
+it automatically scans for a USBSID-Pico on available serial ports (matching VID `0xCAFE` /
+PID `0x4011`) and connects through the COM port. No code changes needed — just enable the feature.
 
 ### Write modes
 
