@@ -13,6 +13,7 @@
 //! 2. **Asynchronous direct** – non-blocking via `libusb_submit_transfer` (the `write*` family).
 //! 3. **Asynchronous threaded** – writes go into a ring buffer; a background thread drains
 //!    it and submits USB transfers (the `write_ring*` family).
+//!
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,8 +21,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, warn};
-#[cfg(feature = "usb")]
-use rusb::{Context, DeviceHandle, UsbContext};
 
 use crate::constants::*;
 use crate::error::{Result, UsbSidError};
@@ -43,16 +42,8 @@ struct SharedState {
 /// Create with [`UsbSid::new`] and then call [`UsbSid::init`] to open the
 /// connection and optionally start the background writer thread.
 pub struct UsbSid {
-    // ── USB (libusb, only with "usb" feature) ────────────────────────────
-    #[cfg(feature = "usb")]
-    ctx: Option<Context>,
-    #[cfg(feature = "usb")]
-    handle: Option<DeviceHandle<Context>>,
-
-    // ── Transport abstraction (serial backend) ───────────────────────────
+    // ── Transport abstraction (single connection, shared with writer thread) ─
     transport: Option<Arc<Mutex<Box<dyn Transport>>>>,
-    #[cfg(feature = "serial")]
-    use_serial: bool,
 
     // ── Buffers ────────────────────────────────────────────────────────────
     out_buffer: Vec<u8>,
@@ -106,13 +97,7 @@ impl UsbSid {
     pub fn new() -> Self {
         debug!("[USBSID] Driver init start");
         Self {
-            #[cfg(feature = "usb")]
-            ctx: None,
-            #[cfg(feature = "usb")]
-            handle: None,
             transport: None,
-            #[cfg(feature = "serial")]
-            use_serial: false,
 
             out_buffer: vec![0u8; LEN_OUT_BUFFER],
             write_buffer: vec![0u8; LEN_OUT_BUFFER],
@@ -175,12 +160,11 @@ impl UsbSid {
         self.threaded = start_threaded;
         self.with_cycles = with_cycles;
 
-        // Try available backends. USB first (if enabled), then serial (default).
+        // Try available backends. USB first (if enabled), then serial.
         #[cfg(feature = "usb")]
         match self.libusb_setup() {
             Ok(()) => {
                 debug!("[USBSID] USB (libusb) backend connected");
-                // Skip serial setup below
                 if self.threaded {
                     self.init_thread()?;
                 }
@@ -221,13 +205,6 @@ impl UsbSid {
             return;
         }
         self.stop_thread();
-        #[cfg(feature = "usb")]
-        {
-            self.handle = None;
-            if let Some(ctx) = self.ctx.take() {
-                drop(ctx);
-            }
-        }
         self.transport = None;
         self.port_is_open = false;
         debug!("[USBSID] Closed device");
@@ -244,10 +221,6 @@ impl UsbSid {
 
     /// `true` if a USBSID-Pico was detected on the bus during [`init`](Self::init).
     pub fn is_available(&self) -> bool {
-        #[cfg(feature = "usb")]
-        if self.ctx.is_some() {
-            return true;
-        }
         self.transport.is_some()
     }
 
@@ -771,125 +744,45 @@ impl UsbSid {
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    //  Private: I/O dispatch
+    //  Private: I/O dispatch (single transport, shared with writer thread)
     // ═════════════════════════════════════════════════════════════════════
 
-    /// Send bytes to the device (USB handle or serial transport).
+    /// Send bytes to the device via the shared transport.
     fn send_bytes(&self, data: &[u8]) -> Result<()> {
-        // Try serial transport first
         if let Some(ref t) = self.transport {
             let mut guard = t.lock().unwrap();
             guard.send(data)?;
             return Ok(());
         }
-        // Fall back to USB handle
-        #[cfg(feature = "usb")]
-        if let Some(ref h) = self.handle {
-            h.write_bulk(EP_OUT_ADDR, data, Duration::from_secs(1))?;
-            return Ok(());
-        }
         Err(UsbSidError::PortNotOpen)
     }
 
-    /// Receive bytes from the device (USB handle or serial transport).
+    /// Receive bytes from the device via the shared transport.
     fn recv_bytes(&self, buf: &mut [u8]) -> Result<usize> {
-        // Try serial transport first
         if let Some(ref t) = self.transport {
             let mut guard = t.lock().unwrap();
             return guard.recv(buf);
         }
-        // Fall back to USB handle
-        #[cfg(feature = "usb")]
-        if let Some(ref h) = self.handle {
-            let n = h.read_bulk(EP_IN_ADDR, buf, Duration::from_secs(1))?;
-            return Ok(n);
-        }
         Err(UsbSidError::PortNotOpen)
     }
 
     // ═════════════════════════════════════════════════════════════════════
-    //  Private: USB setup
+    //  Private: USB setup (creates transport, stores in self.transport)
     // ═════════════════════════════════════════════════════════════════════
 
     #[cfg(feature = "usb")]
     fn libusb_setup(&mut self) -> Result<()> {
-        let ctx = Context::new()?;
+        use crate::transport::usb::UsbTransport;
 
-        // Check availability
-        let devices = ctx.devices()?;
-        let mut found = false;
-        for dev in devices.iter() {
-            if let Ok(desc) = dev.device_descriptor() {
-                if desc.vendor_id() == VENDOR_ID && desc.product_id() == PRODUCT_ID {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if !found {
-            return Err(UsbSidError::DeviceNotFound {
-                vid: VENDOR_ID,
-                pid: PRODUCT_ID,
-            });
-        }
-
-        // Open device
-        let handle = ctx.open_device_with_vid_pid(VENDOR_ID, PRODUCT_ID).ok_or(
-            UsbSidError::DeviceNotFound {
-                vid: VENDOR_ID,
-                pid: PRODUCT_ID,
-            },
-        )?;
-
-        // Detach kernel driver & claim interfaces.
-        //
-        // On Linux the OS auto-attaches the cdc-acm driver to CDC devices,
-        // so we must detach it before claiming.  On macOS and Windows
-        // `kernel_driver_active()` returns `NotSupported` which we ignore.
-        for if_num in 0..2u8 {
-            #[cfg(target_os = "linux")]
-            {
-                if handle.kernel_driver_active(if_num).unwrap_or(false) {
-                    let _ = handle.detach_kernel_driver(if_num);
-                }
-            }
-
-            // On macOS, if the AppleUSBCDCACMData kext has grabbed the
-            // device you may need to set auto-detach instead:
-            #[cfg(target_os = "macos")]
-            {
-                let _ = handle.set_auto_detach_kernel_driver(true);
-            }
-
-            handle.claim_interface(if_num)?;
-        }
-
-        // Configure: set line state (DTR | RTS)
-        handle.write_control(
-            0x21,                        // bmRequestType
-            0x22,                        // SET_CONTROL_LINE_STATE
-            ACM_CTRL_DTR | ACM_CTRL_RTS, // wValue
-            0,                           // wIndex
-            &[],                         // no data
-            Duration::from_secs(1),
-        )?;
-
-        // Set line encoding (baud rate – ignored by TinyUSB but required by spec)
-        handle.write_control(
-            0x21, // bmRequestType
-            0x20, // SET_LINE_CODING
-            0,    // wValue
-            0,    // wIndex
-            &LINE_ENCODING,
-            Duration::from_secs(1),
-        )?;
-
-        self.handle = Some(handle);
-        self.ctx = Some(ctx);
+        debug!("[USBSID] Attempting USB (libusb) connection");
+        let transport = UsbTransport::open()?;
+        self.transport = Some(Arc::new(Mutex::new(
+            Box::new(transport) as Box<dyn Transport>
+        )));
         Ok(())
     }
 
-    // ── Private: serial port setup (Windows-friendly) ────────────────────
+    // ── Private: serial port setup ──────────────────────────────────────
 
     #[cfg(feature = "serial")]
     fn serial_setup(&mut self) -> Result<()> {
@@ -897,31 +790,16 @@ impl UsbSid {
 
         debug!("[USBSID] Attempting serial port connection");
         let transport = SerialTransport::open_auto()?;
-        self.transport = Some(Arc::new(Mutex::new(Box::new(transport))));
-        self.use_serial = true;
+        self.transport = Some(Arc::new(Mutex::new(
+            Box::new(transport) as Box<dyn Transport>
+        )));
         debug!("[USBSID] Serial port connected");
         Ok(())
     }
 
-    // ── Private: threading ───────────────────────────────────────────────
-
-    /// Create a fresh transport for the writer thread.
-    fn create_thread_transport(&self) -> Result<Box<dyn Transport>> {
-        #[cfg(feature = "serial")]
-        if self.use_serial {
-            use crate::transport::serial::SerialTransport;
-            return Ok(Box::new(SerialTransport::open_auto()?));
-        }
-
-        #[cfg(feature = "usb")]
-        {
-            use crate::transport::usb::UsbTransport;
-            return Ok(Box::new(UsbTransport::open()?));
-        }
-
-        #[allow(unreachable_code)]
-        Err(UsbSidError::PortNotOpen)
-    }
+    // ═════════════════════════════════════════════════════════════════════
+    //  Private: threading (single shared transport, no dual handle)
+    // ═════════════════════════════════════════════════════════════════════
 
     fn init_thread(&mut self) -> Result<()> {
         debug!("[USBSID] Init Thread start");
@@ -939,8 +817,8 @@ impl UsbSid {
         self.run_thread.store(true, Ordering::SeqCst);
         self.thread_count.fetch_add(1, Ordering::SeqCst);
 
-        // Create a transport for the writer thread.
-        let thread_transport = self.create_thread_transport()?;
+        // Clone the Arc to the existing transport – no second handle opened.
+        let transport = self.transport.clone().ok_or(UsbSidError::PortNotOpen)?;
 
         let run_flag = Arc::clone(&self.run_thread);
         let shared = Arc::clone(&self.shared);
@@ -951,7 +829,7 @@ impl UsbSid {
         let join = thread::Builder::new()
             .name("USBSID Thread".into())
             .spawn(move || {
-                Self::writer_thread(run_flag, shared, with_cycles, thread_transport, len_out);
+                Self::writer_thread(run_flag, shared, with_cycles, transport, len_out);
                 thread_count.fetch_sub(1, Ordering::SeqCst);
             })
             .map_err(|e| UsbSidError::Thread(e.to_string()))?;
@@ -986,12 +864,19 @@ impl UsbSid {
         }
     }
 
-    /// The actual background thread function.
+    /// The background writer thread.
+    ///
+    /// # Lock ordering
+    ///
+    /// To prevent deadlocks the thread **always** drops the ring-buffer lock
+    /// (`shared`) before acquiring the transport lock for USB sends.  The main
+    /// thread never holds both locks simultaneously either (it uses `send_bytes`
+    /// and `shared.lock()` in separate, non-nested scopes).
     fn writer_thread(
         run: Arc<AtomicBool>,
         shared: Arc<Mutex<SharedState>>,
         with_cycles: bool,
-        mut transport: Box<dyn Transport>,
+        transport: Arc<Mutex<Box<dyn Transport>>>,
         len_out: usize,
     ) {
         debug!("[USBSID] Thread starting");
@@ -1000,72 +885,107 @@ impl UsbSid {
         let mut buffer_pos: usize = 1;
 
         while run.load(Ordering::SeqCst) {
-            let mut locked = shared.lock().unwrap();
+            // ── Phase 1: drain ring buffer under the shared lock ─────────
+            // We collect data into local buffers and note what needs sending,
+            // then drop the shared lock before touching the transport.
+            let mut pending_send: Option<usize> = None;
 
-            // Handle flush
-            if locked.flush {
-                let min_pos = if with_cycles { 5 } else { 3 };
-                if buffer_pos >= min_pos {
-                    thread_buf[0] = if with_cycles {
-                        cycled_write_header((buffer_pos - 1) as u8)
+            {
+                let mut locked = shared.lock().unwrap();
+
+                // Handle flush request
+                if locked.flush {
+                    let min_pos = if with_cycles { 5 } else { 3 };
+                    if buffer_pos >= min_pos {
+                        thread_buf[0] = if with_cycles {
+                            cycled_write_header((buffer_pos - 1) as u8)
+                        } else {
+                            write_header((buffer_pos - 1) as u8)
+                        };
+                        out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                        pending_send = Some(buffer_pos);
+                        buffer_pos = 1;
+                        thread_buf.fill(0);
+                    }
+                    locked.flush = false;
+                }
+
+                // Drain ring buffer entries
+                while locked.ring.has_data() {
+                    if with_cycles {
+                        // Pop: reg, val, cycles_hi, cycles_lo
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
+
+                        if buffer_pos >= 61 || buffer_pos >= len_out || locked.flush {
+                            locked.flush = false;
+                            thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
+                            out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+
+                            let send_len = buffer_pos;
+                            buffer_pos = 1;
+
+                            // Drop shared lock before sending
+                            drop(locked);
+
+                            // ── Phase 2a: send under transport lock ──
+                            if let Ok(mut t) = transport.lock() {
+                                let _ = t.send(&out_buf[..send_len]);
+                            }
+                            thread_buf.fill(0);
+                            out_buf.fill(0);
+
+                            // Re-acquire for next iteration
+                            locked = shared.lock().unwrap();
+                        }
                     } else {
-                        write_header((buffer_pos - 1) as u8)
-                    };
-                    out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                    let _ = transport.send(&out_buf[..buffer_pos]);
-                    buffer_pos = 1;
-                    thread_buf.fill(0);
-                    out_buf.fill(0);
-                }
-                locked.flush = false;
-            }
+                        // Pop: reg, val
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
+                        thread_buf[buffer_pos] = locked.ring.get();
+                        buffer_pos += 1;
 
-            // Drain ring buffer
-            while locked.ring.has_data() {
-                if with_cycles {
-                    // Pop: reg, val, cycles_hi, cycles_lo
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
+                        if buffer_pos >= 63 || buffer_pos >= len_out || locked.flush {
+                            locked.flush = false;
+                            thread_buf[0] = write_header((buffer_pos - 1) as u8);
+                            out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
 
-                    if buffer_pos >= 61 || buffer_pos >= len_out || locked.flush {
-                        locked.flush = false;
-                        thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
-                        out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                        buffer_pos = 1;
-                        drop(locked);
-                        let _ = transport.send(&out_buf);
-                        thread_buf.fill(0);
-                        out_buf.fill(0);
-                        locked = shared.lock().unwrap();
-                    }
-                } else {
-                    // Pop: reg, val
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
-                    thread_buf[buffer_pos] = locked.ring.get();
-                    buffer_pos += 1;
+                            let send_len = buffer_pos;
+                            buffer_pos = 1;
 
-                    if buffer_pos >= 63 || buffer_pos >= len_out || locked.flush {
-                        locked.flush = false;
-                        thread_buf[0] = write_header((buffer_pos - 1) as u8);
-                        out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                        buffer_pos = 1;
-                        drop(locked);
-                        let _ = transport.send(&out_buf);
-                        thread_buf.fill(0);
-                        out_buf.fill(0);
-                        locked = shared.lock().unwrap();
+                            // Drop shared lock before sending
+                            drop(locked);
+
+                            // ── Phase 2a: send under transport lock ──
+                            if let Ok(mut t) = transport.lock() {
+                                let _ = t.send(&out_buf[..send_len]);
+                            }
+                            thread_buf.fill(0);
+                            out_buf.fill(0);
+
+                            // Re-acquire for next iteration
+                            locked = shared.lock().unwrap();
+                        }
                     }
                 }
+
+                // shared lock is dropped here at end of scope
             }
 
-            drop(locked);
+            // ── Phase 2b: send flush data (outside shared lock) ──────────
+            if let Some(len) = pending_send {
+                if let Ok(mut t) = transport.lock() {
+                    let _ = t.send(&out_buf[..len]);
+                }
+                out_buf.fill(0);
+            }
+
             thread::sleep(Duration::from_micros(10));
         }
 
