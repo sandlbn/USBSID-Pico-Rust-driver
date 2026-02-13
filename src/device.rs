@@ -26,7 +26,6 @@ use crate::constants::*;
 use crate::error::{Result, UsbSidError};
 use crate::ringbuffer::RingBuffer;
 use crate::transport::Transport;
-
 // ── Internal shared state ────────────────────────────────────────────────────
 
 /// State shared between the main thread and the background writer thread.
@@ -885,16 +884,18 @@ impl UsbSid {
         let mut buffer_pos: usize = 1;
 
         while run.load(Ordering::SeqCst) {
-            // ── Phase 1: drain ring buffer under the shared lock ─────────
-            // We collect data into local buffers and note what needs sending,
-            // then drop the shared lock before touching the transport.
-            let mut pending_send: Option<usize> = None;
-
             {
                 let mut locked = shared.lock().unwrap();
 
-                // Handle flush request
-                if locked.flush {
+                // Capture flush flag before clearing — we need it to
+                // bypass the diff_size threshold in the drain loop.
+                let flushing = locked.flush;
+                if flushing {
+                    locked.flush = false;
+
+                    // Send any partial packet left over from previous
+                    // drain immediately (not deferred — avoids out_buf
+                    // clobber if the drain below also sends).
                     let min_pos = if with_cycles { 5 } else { 3 };
                     if buffer_pos >= min_pos {
                         thread_buf[0] = if with_cycles {
@@ -903,15 +904,27 @@ impl UsbSid {
                             write_header((buffer_pos - 1) as u8)
                         };
                         out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                        pending_send = Some(buffer_pos);
+                        let send_len = buffer_pos;
                         buffer_pos = 1;
                         thread_buf.fill(0);
+                        drop(locked);
+                        if let Ok(mut t) = transport.lock() {
+                            let _ = t.send(&out_buf[..send_len]);
+                        }
+                        out_buf.fill(0);
+                        locked = shared.lock().unwrap();
                     }
-                    locked.flush = false;
                 }
 
-                // Drain ring buffer entries
-                while locked.ring.has_data() {
+                // Drain ring buffer entries.
+                // Normal: has_data() requires diff > diff_size (64) — batches for efficiency.
+                // Flush:  !is_empty() drains ALL data — sparse tunes need this or their
+                //         writes never reach the threshold and stay stuck in the ring.
+                while if flushing {
+                    !locked.ring.is_empty()
+                } else {
+                    locked.ring.has_data()
+                } {
                     if with_cycles {
                         // Pop: reg, val, cycles_hi, cycles_lo
                         thread_buf[buffer_pos] = locked.ring.get();
@@ -930,18 +943,13 @@ impl UsbSid {
 
                             let send_len = buffer_pos;
                             buffer_pos = 1;
-
-                            // Drop shared lock before sending
                             drop(locked);
-
-                            // ── Phase 2a: send under transport lock ──
                             if let Ok(mut t) = transport.lock() {
                                 let _ = t.send(&out_buf[..send_len]);
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
 
-                            // Re-acquire for next iteration
                             locked = shared.lock().unwrap();
                         }
                     } else {
@@ -958,32 +966,43 @@ impl UsbSid {
 
                             let send_len = buffer_pos;
                             buffer_pos = 1;
-
-                            // Drop shared lock before sending
                             drop(locked);
-
-                            // ── Phase 2a: send under transport lock ──
                             if let Ok(mut t) = transport.lock() {
                                 let _ = t.send(&out_buf[..send_len]);
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
 
-                            // Re-acquire for next iteration
                             locked = shared.lock().unwrap();
                         }
                     }
                 }
 
-                // shared lock is dropped here at end of scope
-            }
-
-            // ── Phase 2b: send flush data (outside shared lock) ──────────
-            if let Some(len) = pending_send {
-                if let Ok(mut t) = transport.lock() {
-                    let _ = t.send(&out_buf[..len]);
+                // After drain: if flushing, send any remaining partial
+                // packet from this frame's writes (ring drained but
+                // buffer didn't fill to 61).
+                if flushing {
+                    let min_pos = if with_cycles { 5 } else { 3 };
+                    if buffer_pos >= min_pos {
+                        thread_buf[0] = if with_cycles {
+                            cycled_write_header((buffer_pos - 1) as u8)
+                        } else {
+                            write_header((buffer_pos - 1) as u8)
+                        };
+                        out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                        let send_len = buffer_pos;
+                        buffer_pos = 1;
+                        thread_buf.fill(0);
+                        drop(locked);
+                        if let Ok(mut t) = transport.lock() {
+                            let _ = t.send(&out_buf[..send_len]);
+                        }
+                        out_buf.fill(0);
+                        // Don't re-acquire — we're at end of scope
+                    }
                 }
-                out_buf.fill(0);
+
+                // shared lock dropped here
             }
 
             thread::sleep(Duration::from_micros(10));
