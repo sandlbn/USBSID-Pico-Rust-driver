@@ -16,7 +16,7 @@
 //!
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,8 @@ use crate::transport::Transport;
 struct SharedState {
     ring: RingBuffer,
     flush: bool,
+    /// Set to `true` by the writer thread after a flush has been fully drained.
+    flush_done: bool,
 }
 
 // ── Main driver ──────────────────────────────────────────────────────────────
@@ -62,6 +64,9 @@ pub struct UsbSid {
     with_cycles: bool,
     run_thread: Arc<AtomicBool>,
     shared: Arc<Mutex<SharedState>>,
+    /// Notifies the writer thread when data is available or flush is requested,
+    /// and notifies the main thread when a flush completes.
+    cond: Arc<Condvar>,
     thread_handle: Option<JoinHandle<()>>,
     thread_count: Arc<AtomicI32>,
 
@@ -114,7 +119,9 @@ impl UsbSid {
             shared: Arc::new(Mutex::new(SharedState {
                 ring: RingBuffer::with_defaults(),
                 flush: false,
+                flush_done: false,
             })),
+            cond: Arc::new(Condvar::new()),
             thread_handle: None,
             thread_count: Arc::new(AtomicI32::new(0)),
 
@@ -614,8 +621,14 @@ impl UsbSid {
             });
         }
         let mut shared = self.shared.lock().unwrap();
+        if shared.ring.is_full() {
+            warn!("[USBSID] Ring buffer overflow (non-cycled write dropped)");
+            return Ok(());
+        }
         shared.ring.put(reg);
         shared.ring.put(val);
+        drop(shared);
+        self.cond.notify_one();
         Ok(())
     }
 
@@ -631,10 +644,16 @@ impl UsbSid {
             });
         }
         let mut shared = self.shared.lock().unwrap();
+        if shared.ring.is_full() {
+            warn!("[USBSID] Ring buffer overflow (cycled write dropped)");
+            return Ok(());
+        }
         shared.ring.put(reg);
         shared.ring.put(val);
         shared.ring.put((cycles >> 8) as u8);
         shared.ring.put((cycles & 0xFF) as u8);
+        drop(shared);
+        self.cond.notify_one();
         Ok(())
     }
 
@@ -666,15 +685,24 @@ impl UsbSid {
         self.sync_time();
         if let Ok(mut s) = self.shared.lock() {
             s.flush = true;
+            s.flush_done = false;
         }
+        self.cond.notify_one();
     }
 
-    /// Signal a flush and then wait for the flush to complete.
+    /// Signal a flush and block until the writer thread has drained the ring.
     pub fn flush(&mut self) {
         if !self.port_is_open {
             return;
         }
         self.set_flush();
+
+        // Wait for the writer thread to signal completion (up to 100ms).
+        if let Ok(locked) = self.shared.lock() {
+            let _r = self
+                .cond
+                .wait_timeout_while(locked, Duration::from_millis(100), |s| !s.flush_done);
+        }
     }
 
     /// Restart the ring buffer (deinit + reinit).
@@ -821,6 +849,7 @@ impl UsbSid {
 
         let run_flag = Arc::clone(&self.run_thread);
         let shared = Arc::clone(&self.shared);
+        let cond = Arc::clone(&self.cond);
         let with_cycles = self.with_cycles;
         let thread_count = Arc::clone(&self.thread_count);
         let len_out = self.len_out_buffer;
@@ -828,7 +857,7 @@ impl UsbSid {
         let join = thread::Builder::new()
             .name("USBSID Thread".into())
             .spawn(move || {
-                Self::writer_thread(run_flag, shared, with_cycles, transport, len_out);
+                Self::writer_thread(run_flag, shared, cond, with_cycles, transport, len_out);
                 thread_count.fetch_sub(1, Ordering::SeqCst);
             })
             .map_err(|e| UsbSidError::Thread(e.to_string()))?;
@@ -843,6 +872,7 @@ impl UsbSid {
         }
         debug!("[USBSID] Stop thread");
         self.run_thread.store(false, Ordering::SeqCst);
+        self.cond.notify_all(); // Wake writer thread so it sees run=false
 
         // Wait for the thread to finish
         if let Some(h) = self.thread_handle.take() {
@@ -874,6 +904,7 @@ impl UsbSid {
     fn writer_thread(
         run: Arc<AtomicBool>,
         shared: Arc<Mutex<SharedState>>,
+        cond: Arc<Condvar>,
         with_cycles: bool,
         transport: Arc<Mutex<Box<dyn Transport>>>,
         len_out: usize,
@@ -885,7 +916,15 @@ impl UsbSid {
 
         while run.load(Ordering::SeqCst) {
             {
+                // Wait until there is data to drain or a flush is requested.
+                // Times out after 1ms to re-check the run flag.
                 let mut locked = shared.lock().unwrap();
+                if !locked.flush && !locked.ring.has_data() && locked.ring.is_empty() {
+                    locked = cond
+                        .wait_timeout(locked, Duration::from_millis(1))
+                        .unwrap()
+                        .0;
+                }
 
                 // Capture flush flag before clearing — we need it to
                 // bypass the diff_size threshold in the drain loop.
@@ -909,7 +948,12 @@ impl UsbSid {
                         thread_buf.fill(0);
                         drop(locked);
                         if let Ok(mut t) = transport.lock() {
-                            let _ = t.send(&out_buf[..send_len]);
+                            if let Err(e) = t.send(&out_buf[..send_len]) {
+                                warn!("[USBSID] USB send failed (pre-flush): {e}, retrying");
+                                if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                    error!("[USBSID] USB send retry failed (pre-flush): {e2}");
+                                }
+                            }
                         }
                         out_buf.fill(0);
                         locked = shared.lock().unwrap();
@@ -945,7 +989,14 @@ impl UsbSid {
                             buffer_pos = 1;
                             drop(locked);
                             if let Ok(mut t) = transport.lock() {
-                                let _ = t.send(&out_buf[..send_len]);
+                                if let Err(e) = t.send(&out_buf[..send_len]) {
+                                    warn!("[USBSID] USB send failed (cycled drain): {e}, retrying");
+                                    if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                        error!(
+                                            "[USBSID] USB send retry failed (cycled drain): {e2}"
+                                        );
+                                    }
+                                }
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
@@ -968,7 +1019,12 @@ impl UsbSid {
                             buffer_pos = 1;
                             drop(locked);
                             if let Ok(mut t) = transport.lock() {
-                                let _ = t.send(&out_buf[..send_len]);
+                                if let Err(e) = t.send(&out_buf[..send_len]) {
+                                    warn!("[USBSID] USB send failed (drain): {e}, retrying");
+                                    if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                        error!("[USBSID] USB send retry failed (drain): {e2}");
+                                    }
+                                }
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
@@ -995,17 +1051,24 @@ impl UsbSid {
                         thread_buf.fill(0);
                         drop(locked);
                         if let Ok(mut t) = transport.lock() {
-                            let _ = t.send(&out_buf[..send_len]);
+                            if let Err(e) = t.send(&out_buf[..send_len]) {
+                                warn!("[USBSID] USB send failed (post-flush): {e}, retrying");
+                                if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                    error!("[USBSID] USB send retry failed (post-flush): {e2}");
+                                }
+                            }
                         }
                         out_buf.fill(0);
-                        // Don't re-acquire — we're at end of scope
+                        locked = shared.lock().unwrap();
                     }
+
+                    // Signal flush completion to any waiting caller.
+                    locked.flush_done = true;
+                    cond.notify_all();
                 }
 
                 // shared lock dropped here
             }
-
-            thread::sleep(Duration::from_micros(10));
         }
 
         debug!("[USBSID] Thread finished");

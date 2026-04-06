@@ -73,10 +73,20 @@ impl RingBuffer {
 
     // ── Mutation ──────────────────────────────────────────────────────────
 
+    /// Returns `true` when the ring buffer is full (write would overwrite unread data).
+    pub fn is_full(&self) -> bool {
+        (self.write_pos + 1) % self.ring_size == self.read_pos
+    }
+
     /// Push one byte into the ring, advancing the write cursor.
-    pub fn put(&mut self, item: u8) {
+    /// Returns `false` if the ring is full and the byte was dropped.
+    pub fn put(&mut self, item: u8) -> bool {
+        if self.is_full() {
+            return false;
+        }
         self.buf[self.write_pos] = item;
         self.write_pos = (self.write_pos + 1) % self.ring_size;
+        true
     }
 
     /// Pop one byte from the ring, advancing the read cursor.
