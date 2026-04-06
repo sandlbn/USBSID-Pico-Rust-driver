@@ -917,13 +917,22 @@ impl UsbSid {
         while run.load(Ordering::SeqCst) {
             {
                 // Wait until there is data to drain or a flush is requested.
-                // Times out after 1ms to re-check the run flag.
                 let mut locked = shared.lock().unwrap();
-                if !locked.flush && !locked.ring.has_data() && locked.ring.is_empty() {
-                    locked = cond
-                        .wait_timeout(locked, Duration::from_millis(1))
-                        .unwrap()
-                        .0;
+                if !locked.flush && !locked.ring.has_data() {
+                    if locked.ring.is_empty() {
+                        // No data at all — block until producer pushes or 1ms elapses.
+                        locked = cond
+                            .wait_timeout(locked, Duration::from_millis(1))
+                            .unwrap()
+                            .0;
+                    } else {
+                        // Some data but below diff threshold — short wait for
+                        // more writes to arrive so we can batch efficiently.
+                        locked = cond
+                            .wait_timeout(locked, Duration::from_micros(100))
+                            .unwrap()
+                            .0;
+                    }
                 }
 
                 // Capture flush flag before clearing — we need it to
