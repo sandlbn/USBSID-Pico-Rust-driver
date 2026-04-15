@@ -444,7 +444,7 @@ checksum = "537dd038a89878be9b64dd4bd1b260315c1bb94f4d784956b81e27a088d9a09e"
 
 [[package]]
 name = "usbsid-pico"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "env_logger",
  "libc",
