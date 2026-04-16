@@ -16,6 +16,8 @@
 //!
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -657,6 +659,48 @@ impl UsbSid {
         Ok(())
     }
 
+    /// Push multiple register + value + 16-bit cycle count entries into the
+    /// ring buffer in a single mutex lock (cycled threaded mode).
+    ///
+    /// This is significantly more efficient than calling [`write_ring_cycled`]
+    /// in a loop because it acquires the mutex once and issues a single condvar
+    /// notification.  Returns the number of writes that were successfully pushed
+    /// (may be less than `writes.len()` if the ring fills up).
+    pub fn write_ring_cycled_batch(&self, writes: &[(u8, u8, u16)]) -> Result<usize> {
+        if !self.port_is_open {
+            return Err(UsbSidError::PortNotOpen);
+        }
+        if !(self.threaded && self.with_cycles) {
+            return Err(UsbSidError::WrongThreadMode {
+                expected_threaded: true,
+                expected_cycled: true,
+            });
+        }
+        let mut shared = self.shared.lock().unwrap();
+        let mut pushed = 0usize;
+        for &(reg, val, cycles) in writes {
+            if shared.ring.is_full() {
+                eprintln!(
+                    "[USBSID] Ring buffer overflow ({} of {} cycled writes dropped, capacity={})",
+                    writes.len() - pushed,
+                    writes.len(),
+                    shared.ring.capacity(),
+                );
+                break;
+            }
+            shared.ring.put(reg);
+            shared.ring.put(val);
+            shared.ring.put((cycles >> 8) as u8);
+            shared.ring.put((cycles & 0xFF) as u8);
+            pushed += 1;
+        }
+        drop(shared);
+        if pushed > 0 {
+            self.cond.notify_one();
+        }
+        Ok(pushed)
+    }
+
     // ═════════════════════════════════════════════════════════════════════
     //  Thread management
     // ═════════════════════════════════════════════════════════════════════
@@ -895,13 +939,189 @@ impl UsbSid {
 
     /// The background writer thread.
     ///
-    /// # Lock ordering
+    /// On macOS, spawns a dedicated USB I/O thread to absorb the ~18ms
+    /// bulk transfer latency of the CDC-ACM driver.  Ring drains happen
+    /// instantly; USB sends run in parallel via a channel.
     ///
-    /// To prevent deadlocks the thread **always** drops the ring-buffer lock
-    /// (`shared`) before acquiring the transport lock for USB sends.  The main
-    /// thread never holds both locks simultaneously either (it uses `send_bytes`
-    /// and `shared.lock()` in separate, non-nested scopes).
+    /// On Linux/Windows, uses the original direct-send path (USB bulk
+    /// transfers complete in sub-millisecond, no pipelining needed).
     fn writer_thread(
+        run: Arc<AtomicBool>,
+        shared: Arc<Mutex<SharedState>>,
+        cond: Arc<Condvar>,
+        with_cycles: bool,
+        transport: Arc<Mutex<Box<dyn Transport>>>,
+        len_out: usize,
+    ) {
+        #[cfg(target_os = "macos")]
+        Self::writer_thread_macos(run, shared, cond, with_cycles, transport, len_out);
+
+        #[cfg(not(target_os = "macos"))]
+        Self::writer_thread_default(run, shared, cond, with_cycles, transport, len_out);
+    }
+
+    /// macOS writer: async USB I/O thread + mega-send (64-byte aligned packets).
+    #[cfg(target_os = "macos")]
+    fn writer_thread_macos(
+        run: Arc<AtomicBool>,
+        shared: Arc<Mutex<SharedState>>,
+        cond: Arc<Condvar>,
+        with_cycles: bool,
+        transport: Arc<Mutex<Box<dyn Transport>>>,
+        _len_out: usize,
+    ) {
+        debug!("[USBSID] Writer thread starting (macOS async path)");
+
+        let (usb_tx, usb_rx) = mpsc::sync_channel::<Vec<u8>>(3);
+        let io_transport = Arc::clone(&transport);
+        let io_run = Arc::clone(&run);
+
+        let io_thread = thread::Builder::new()
+            .name("USBSID USB-IO".into())
+            .spawn(move || {
+                while let Ok(buf) = usb_rx.recv() {
+                    if !io_run.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Ok(mut t) = io_transport.lock() {
+                        if let Err(e) = t.send(&buf) {
+                            eprintln!("[USBSID-IO] USB send failed: {e}, retrying");
+                            let _ = t.send(&buf);
+                        }
+                    }
+                }
+            })
+            .ok();
+
+        let mut buffer_pos: usize = 1;
+        let mut thread_buf = vec![0u8; 64];
+
+        while run.load(Ordering::SeqCst) {
+            {
+                let mut locked = shared.lock().unwrap();
+                if !locked.flush && !locked.ring.has_data() {
+                    if locked.ring.is_empty() {
+                        locked = cond
+                            .wait_timeout(locked, Duration::from_millis(1))
+                            .unwrap()
+                            .0;
+                    } else {
+                        locked = cond
+                            .wait_timeout(locked, Duration::from_micros(100))
+                            .unwrap()
+                            .0;
+                    }
+                }
+
+                let flushing = locked.flush;
+                let ring_pending = locked.ring.diff();
+
+                if flushing {
+                    locked.flush = false;
+
+                    let max_packets = (ring_pending / 4).max(1) + 2;
+                    let mut mega_buf: Vec<u8> = Vec::with_capacity(max_packets * 64);
+                    let mut pkt = [0u8; 64];
+                    let mut pkt_pos: usize = 1;
+
+                    if with_cycles {
+                        if buffer_pos >= 5 {
+                            thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
+                            pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                            mega_buf.extend_from_slice(&pkt[..64]);
+                            pkt.fill(0);
+                            thread_buf.fill(0);
+                        }
+                    } else if buffer_pos >= 3 {
+                        thread_buf[0] = write_header((buffer_pos - 1) as u8);
+                        pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                        mega_buf.extend_from_slice(&pkt[..64]);
+                        pkt.fill(0);
+                        thread_buf.fill(0);
+                    }
+
+                    while !locked.ring.is_empty() {
+                        if with_cycles {
+                            pkt[pkt_pos] = locked.ring.get();
+                            pkt[pkt_pos + 1] = locked.ring.get();
+                            pkt[pkt_pos + 2] = locked.ring.get();
+                            pkt[pkt_pos + 3] = locked.ring.get();
+                            pkt_pos += 4;
+                            if pkt_pos >= 61 || locked.ring.is_empty() {
+                                pkt[0] = cycled_write_header((pkt_pos - 1) as u8);
+                                mega_buf.extend_from_slice(&pkt[..64]);
+                                pkt.fill(0);
+                                pkt_pos = 1;
+                            }
+                        } else {
+                            pkt[pkt_pos] = locked.ring.get();
+                            pkt[pkt_pos + 1] = locked.ring.get();
+                            pkt_pos += 2;
+                            if pkt_pos >= 63 || locked.ring.is_empty() {
+                                pkt[0] = write_header((pkt_pos - 1) as u8);
+                                mega_buf.extend_from_slice(&pkt[..64]);
+                                pkt.fill(0);
+                                pkt_pos = 1;
+                            }
+                        }
+                    }
+
+                    drop(locked);
+                    if !mega_buf.is_empty() {
+                        let _ = usb_tx.send(mega_buf);
+                    }
+                    buffer_pos = 1;
+
+                    let mut locked = shared.lock().unwrap();
+                    locked.flush_done = true;
+                    cond.notify_all();
+                } else {
+                    while locked.ring.has_data() {
+                        if with_cycles {
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            if buffer_pos >= 61 {
+                                thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
+                                let mut pkt = [0u8; 64];
+                                pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                                let _ = usb_tx.send(pkt.to_vec());
+                                thread_buf.fill(0);
+                                buffer_pos = 1;
+                            }
+                        } else {
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            thread_buf[buffer_pos] = locked.ring.get();
+                            buffer_pos += 1;
+                            if buffer_pos >= 63 {
+                                thread_buf[0] = write_header((buffer_pos - 1) as u8);
+                                let mut pkt = [0u8; 64];
+                                pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
+                                let _ = usb_tx.send(pkt.to_vec());
+                                thread_buf.fill(0);
+                                buffer_pos = 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        drop(usb_tx);
+        if let Some(h) = io_thread {
+            let _ = h.join();
+        }
+    }
+
+    /// Linux/Windows writer: original direct-send path.
+    #[cfg(not(target_os = "macos"))]
+    fn writer_thread_default(
         run: Arc<AtomicBool>,
         shared: Arc<Mutex<SharedState>>,
         cond: Arc<Condvar>,
@@ -916,18 +1136,14 @@ impl UsbSid {
 
         while run.load(Ordering::SeqCst) {
             {
-                // Wait until there is data to drain or a flush is requested.
                 let mut locked = shared.lock().unwrap();
                 if !locked.flush && !locked.ring.has_data() {
                     if locked.ring.is_empty() {
-                        // No data at all — block until producer pushes or 1ms elapses.
                         locked = cond
                             .wait_timeout(locked, Duration::from_millis(1))
                             .unwrap()
                             .0;
                     } else {
-                        // Some data but below diff threshold — short wait for
-                        // more writes to arrive so we can batch efficiently.
                         locked = cond
                             .wait_timeout(locked, Duration::from_micros(100))
                             .unwrap()
@@ -935,15 +1151,10 @@ impl UsbSid {
                     }
                 }
 
-                // Capture flush flag before clearing — we need it to
-                // bypass the diff_size threshold in the drain loop.
                 let flushing = locked.flush;
                 if flushing {
                     locked.flush = false;
 
-                    // Send any partial packet left over from previous
-                    // drain immediately (not deferred — avoids out_buf
-                    // clobber if the drain below also sends).
                     let min_pos = if with_cycles { 5 } else { 3 };
                     if buffer_pos >= min_pos {
                         thread_buf[0] = if with_cycles {
@@ -969,17 +1180,12 @@ impl UsbSid {
                     }
                 }
 
-                // Drain ring buffer entries.
-                // Normal: has_data() requires diff > diff_size (64) — batches for efficiency.
-                // Flush:  !is_empty() drains ALL data — sparse tunes need this or their
-                //         writes never reach the threshold and stay stuck in the ring.
                 while if flushing {
                     !locked.ring.is_empty()
                 } else {
                     locked.ring.has_data()
                 } {
                     if with_cycles {
-                        // Pop: reg, val, cycles_hi, cycles_lo
                         thread_buf[buffer_pos] = locked.ring.get();
                         buffer_pos += 1;
                         thread_buf[buffer_pos] = locked.ring.get();
@@ -993,7 +1199,6 @@ impl UsbSid {
                             locked.flush = false;
                             thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
                             out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-
                             let send_len = buffer_pos;
                             buffer_pos = 1;
                             drop(locked);
@@ -1001,19 +1206,15 @@ impl UsbSid {
                                 if let Err(e) = t.send(&out_buf[..send_len]) {
                                     warn!("[USBSID] USB send failed (cycled drain): {e}, retrying");
                                     if let Err(e2) = t.send(&out_buf[..send_len]) {
-                                        error!(
-                                            "[USBSID] USB send retry failed (cycled drain): {e2}"
-                                        );
+                                        error!("[USBSID] USB send retry failed (cycled drain): {e2}");
                                     }
                                 }
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
-
                             locked = shared.lock().unwrap();
                         }
                     } else {
-                        // Pop: reg, val
                         thread_buf[buffer_pos] = locked.ring.get();
                         buffer_pos += 1;
                         thread_buf[buffer_pos] = locked.ring.get();
@@ -1023,7 +1224,6 @@ impl UsbSid {
                             locked.flush = false;
                             thread_buf[0] = write_header((buffer_pos - 1) as u8);
                             out_buf[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-
                             let send_len = buffer_pos;
                             buffer_pos = 1;
                             drop(locked);
@@ -1037,15 +1237,11 @@ impl UsbSid {
                             }
                             thread_buf.fill(0);
                             out_buf.fill(0);
-
                             locked = shared.lock().unwrap();
                         }
                     }
                 }
 
-                // After drain: if flushing, send any remaining partial
-                // packet from this frame's writes (ring drained but
-                // buffer didn't fill to 61).
                 if flushing {
                     let min_pos = if with_cycles { 5 } else { 3 };
                     if buffer_pos >= min_pos {
@@ -1071,12 +1267,9 @@ impl UsbSid {
                         locked = shared.lock().unwrap();
                     }
 
-                    // Signal flush completion to any waiting caller.
                     locked.flush_done = true;
                     cond.notify_all();
                 }
-
-                // shared lock dropped here
             }
         }
 

@@ -143,7 +143,7 @@ pub const CLOCK_TABLE: [(ClockSpeed, RefreshRate, RasterRate); 5] = [
 pub const MIN_DIFF_SIZE: usize = 16;
 pub const MIN_RING_SIZE: usize = 256;
 pub const DEFAULT_DIFF_SIZE: usize = 64;
-pub const DEFAULT_RING_SIZE: usize = 8192;
+pub const DEFAULT_RING_SIZE: usize = 32768;
 
 // ── SID address helpers ──────────────────────────────────────────────────────
 
