@@ -7,22 +7,40 @@
 
 //! Fixed-size, single-producer / single-consumer ring buffer used by the
 //! background writer thread.
+//!
+//! Uses atomic cursors so the producer (player thread) can push data without
+//! acquiring the shared mutex — matching the C++ driver's lock-free RingPut.
+
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::constants::{DEFAULT_DIFF_SIZE, DEFAULT_RING_SIZE, MIN_DIFF_SIZE, MIN_RING_SIZE};
 
-/// A byte-level ring buffer with configurable capacity.
+/// A byte-level SPSC ring buffer with lock-free put/get.
+///
+/// The producer calls [`put`] without any external lock.
+/// The consumer calls [`get`] without any external lock.
+/// Safety relies on single-producer / single-consumer discipline.
 pub struct RingBuffer {
-    /// Backing storage.
-    buf: Vec<u8>,
-    /// Current read cursor.
-    pub read_pos: usize,
-    /// Current write cursor.
-    pub write_pos: usize,
+    /// Backing storage — UnsafeCell allows mutation from &self.
+    buf: UnsafeCell<Vec<u8>>,
+    /// Current read cursor (only mutated by consumer).
+    read_pos: AtomicUsize,
+    /// Current write cursor (only mutated by producer).
+    write_pos: AtomicUsize,
     /// Total ring capacity.
     ring_size: usize,
     /// Minimum difference between head and tail before the writer thread pops.
     diff_size: usize,
 }
+
+// SAFETY: RingBuffer is designed for single-producer / single-consumer use.
+// The backing Vec is allocated once and never reallocated during SPSC operation.
+// read_pos is only mutated by the consumer, write_pos only by the producer.
+// Producer writes to buf[write_pos], consumer reads from buf[read_pos].
+// These never overlap because is_full() prevents write_pos from catching read_pos.
+unsafe impl Send for RingBuffer {}
+unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
     /// Create a new ring buffer with the given capacity and diff threshold.
@@ -30,15 +48,15 @@ impl RingBuffer {
         let ring_size = ring_size.max(MIN_RING_SIZE);
         let diff_size = diff_size.max(MIN_DIFF_SIZE);
         Self {
-            buf: vec![0u8; ring_size],
-            read_pos: 0,
-            write_pos: 0,
+            buf: UnsafeCell::new(vec![0u8; ring_size]),
+            read_pos: AtomicUsize::new(0),
+            write_pos: AtomicUsize::new(0),
             ring_size,
             diff_size,
         }
     }
 
-    /// Create with default sizes (8192 / 64).
+    /// Create with default sizes.
     pub fn with_defaults() -> Self {
         Self::new(DEFAULT_RING_SIZE, DEFAULT_DIFF_SIZE)
     }
@@ -58,56 +76,73 @@ impl RingBuffer {
     /// Returns `true` when there is data to read and the distance between
     /// read and write cursors exceeds `diff_size`.
     pub fn has_data(&self) -> bool {
-        self.read_pos != self.write_pos && self.diff() > self.diff_size
+        let r = self.read_pos.load(Ordering::Acquire);
+        let w = self.write_pos.load(Ordering::Acquire);
+        r != w && r.abs_diff(w) > self.diff_size
     }
 
-    /// Returns `true` when read and write cursors differ.
+    /// Returns `true` when read and write cursors are equal.
     pub fn is_empty(&self) -> bool {
-        self.read_pos == self.write_pos
+        self.read_pos.load(Ordering::Acquire) == self.write_pos.load(Ordering::Acquire)
     }
 
     /// Absolute distance between read and write cursors.
     pub fn diff(&self) -> usize {
-        self.write_pos.abs_diff(self.read_pos)
+        self.read_pos
+            .load(Ordering::Acquire)
+            .abs_diff(self.write_pos.load(Ordering::Acquire))
     }
 
-    // ── Mutation ──────────────────────────────────────────────────────────
+    // ── Lock-free mutation ───────────────────────────────────────────────
 
-    /// Returns `true` when the ring buffer is full (write would overwrite unread data).
+    /// Returns `true` when the ring buffer is full.
     pub fn is_full(&self) -> bool {
-        (self.write_pos + 1) % self.ring_size == self.read_pos
+        let w = self.write_pos.load(Ordering::Relaxed);
+        let r = self.read_pos.load(Ordering::Acquire);
+        (w + 1) % self.ring_size == r
     }
 
     /// Push one byte into the ring, advancing the write cursor.
+    /// Lock-free — safe to call from the producer without any mutex.
     /// Returns `false` if the ring is full and the byte was dropped.
-    pub fn put(&mut self, item: u8) -> bool {
-        if self.is_full() {
-            return false;
+    pub fn put(&self, item: u8) -> bool {
+        let w = self.write_pos.load(Ordering::Relaxed);
+        let r = self.read_pos.load(Ordering::Acquire);
+        if (w + 1) % self.ring_size == r {
+            return false; // full
         }
-        self.buf[self.write_pos] = item;
-        self.write_pos = (self.write_pos + 1) % self.ring_size;
+        // SAFETY: only the producer calls put(), so no concurrent write to buf[w].
+        // The consumer only reads at read_pos, which is behind write_pos.
+        unsafe { (&mut (*self.buf.get()))[w] = item };
+        self.write_pos
+            .store((w + 1) % self.ring_size, Ordering::Release);
         true
     }
 
     /// Pop one byte from the ring, advancing the read cursor.
-    pub fn get(&mut self) -> u8 {
-        let item = self.buf[self.read_pos];
-        self.read_pos = (self.read_pos + 1) % self.ring_size;
+    /// Lock-free — safe to call from the consumer without any mutex.
+    pub fn get(&self) -> u8 {
+        let r = self.read_pos.load(Ordering::Relaxed);
+        // SAFETY: only the consumer calls get(), and the producer never
+        // writes to positions at or behind read_pos.
+        let item = unsafe { (&(*self.buf.get()))[r] };
+        self.read_pos
+            .store((r + 1) % self.ring_size, Ordering::Release);
         item
     }
 
     /// Reset both cursors to zero.
-    pub fn reset(&mut self) {
-        self.read_pos = 0;
-        self.write_pos = 0;
+    pub fn reset(&self) {
+        self.read_pos.store(0, Ordering::Release);
+        self.write_pos.store(0, Ordering::Release);
     }
 
-    // ── Reconfiguration ──────────────────────────────────────────────────
+    // ── Reconfiguration (NOT thread-safe — call only when stopped) ──────
 
-    /// Update the ring capacity (reallocates).  Resets cursors.
+    /// Update the ring capacity (reallocates). Resets cursors.
     pub fn set_ring_size(&mut self, size: usize) {
         self.ring_size = size.max(MIN_RING_SIZE);
-        self.buf.resize(self.ring_size, 0);
+        self.buf.get_mut().resize(self.ring_size, 0);
         self.reset();
     }
 
@@ -122,7 +157,7 @@ impl RingBuffer {
         self.set_diff_size(diff_size);
     }
 
-    /// Reset to defaults (capacity 8192, diff 64).
+    /// Reset to defaults.
     pub fn reinit_defaults(&mut self) {
         self.reinit(DEFAULT_RING_SIZE, DEFAULT_DIFF_SIZE);
     }
