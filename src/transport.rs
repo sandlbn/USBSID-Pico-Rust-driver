@@ -30,6 +30,14 @@ pub(crate) trait Transport: Send {
 
     /// Receive bytes from the device. Returns bytes read.
     fn recv(&mut self, buf: &mut [u8]) -> Result<usize>;
+
+    /// Receive bytes with an explicit timeout in milliseconds. The default
+    /// implementation falls back to `recv`, which uses the transport's
+    /// hard-coded 1 s timeout. Backends that can do better (e.g. libusb's
+    /// `read_bulk`) should override.
+    fn recv_timeout(&mut self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize> {
+        self.recv(buf)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +109,12 @@ pub(crate) mod usb {
         fn recv(&mut self, buf: &mut [u8]) -> Result<usize> {
             self.handle
                 .read_bulk(EP_IN_ADDR, buf, Duration::from_secs(1))
+                .map_err(UsbSidError::Usb)
+        }
+
+        fn recv_timeout(&mut self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
+            self.handle
+                .read_bulk(EP_IN_ADDR, buf, Duration::from_millis(timeout_ms as u64))
                 .map_err(UsbSidError::Usb)
         }
     }

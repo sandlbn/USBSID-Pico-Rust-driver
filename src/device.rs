@@ -509,6 +509,47 @@ impl UsbSid {
         self.send_bytes(buf)
     }
 
+    /// Send arbitrary bytes to the device's bulk-OUT endpoint. Equivalent to
+    /// [`single_write`](Self::single_write) but named to match a transport-
+    /// trait API; intended for configuration / out-of-band protocols
+    /// (e.g. the `usbsid-pico-config` crate's `Transport::send`).
+    pub fn send_raw(&self, buf: &[u8]) -> Result<()> {
+        if !self.port_is_open {
+            return Err(UsbSidError::PortNotOpen);
+        }
+        self.send_bytes(buf)
+    }
+
+    /// Blocking read of up to `max_len` bytes from the bulk-IN endpoint.
+    /// The returned `Vec` is truncated to the number of bytes actually
+    /// received. Returns an error on transport failure; for "no data
+    /// available" cases callers should treat a short / empty read as a
+    /// soft signal rather than a hard error.
+    pub fn recv_raw(&self, max_len: usize) -> Result<Vec<u8>> {
+        if !self.port_is_open {
+            return Err(UsbSidError::PortNotOpen);
+        }
+        let mut buf = vec![0u8; max_len];
+        let n = self.recv_bytes(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Like [`recv_raw`](Self::recv_raw) but with an explicit timeout
+    /// (milliseconds). Useful for "drain pending bytes" patterns where the
+    /// caller wants a fast Timeout error rather than blocking for the
+    /// transport's default 1 s. Backends that don't implement a custom
+    /// timeout will fall back to the default `recv` timeout.
+    pub fn recv_raw_timeout(&self, max_len: usize, timeout_ms: u32) -> Result<Vec<u8>> {
+        if !self.port_is_open {
+            return Err(UsbSidError::PortNotOpen);
+        }
+        let mut buf = vec![0u8; max_len];
+        let n = self.recv_bytes_timeout(&mut buf, timeout_ms)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
     /// Blocking read of a single SID register.
     pub fn single_read(&self, reg: u8) -> Result<u8> {
         if !self.port_is_open {
@@ -830,6 +871,16 @@ impl UsbSid {
         if let Some(ref t) = self.transport {
             let mut guard = t.lock().unwrap();
             return guard.recv(buf);
+        }
+        Err(UsbSidError::PortNotOpen)
+    }
+
+    /// Receive with an explicit per-call timeout. Falls back to the
+    /// transport's default `recv` if the backend doesn't override.
+    fn recv_bytes_timeout(&self, buf: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        if let Some(ref t) = self.transport {
+            let mut guard = t.lock().unwrap();
+            return guard.recv_timeout(buf, timeout_ms);
         }
         Err(UsbSidError::PortNotOpen)
     }
