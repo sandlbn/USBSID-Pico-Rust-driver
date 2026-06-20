@@ -180,8 +180,21 @@ impl UsbSid {
                 if self.threaded {
                     self.init_thread()?;
                 }
-                let _ = self.get_clock_rate();
+                // Order matches the reference C driver
+                // (USBSID-Pico-driver/src/USBSID.cpp:122-126):
+                //   1. port_is_open = true so subsequent calls don't
+                //      early-return on the !port_is_open guard.
+                //   2. mute / clear_bus / unmute — explicit DMA + PIO
+                //      bus reset that firmware 0.7.0+ relies on; without
+                //      it the first writes after open can be swallowed.
+                //   3. get_clock_rate — probe the device's actual clock
+                //      so cycles_per_sec reflects reality rather than
+                //      the ClockSpeed::Default fallback.
                 self.port_is_open = true;
+                self.mute();
+                self.clear_bus();
+                self.unmute();
+                let _ = self.get_clock_rate();
                 return Ok(());
             }
             Err(e) => {
@@ -196,8 +209,12 @@ impl UsbSid {
                 if self.threaded {
                     self.init_thread()?;
                 }
-                let _ = self.get_clock_rate();
+                // Same ordering rationale as the USB branch above.
                 self.port_is_open = true;
+                self.mute();
+                self.clear_bus();
+                self.unmute();
+                let _ = self.get_clock_rate();
                 return Ok(());
             }
             Err(e) => {
