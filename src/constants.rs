@@ -13,11 +13,18 @@ pub const ACM_CTRL_DTR: u16 = 0x01;
 pub const ACM_CTRL_RTS: u16 = 0x02;
 
 // ── Endpoint addresses ───────────────────────────────────────────────────────
+// Linux/Windows use the CDC-ACM interfaces; macOS uses the vendor interface
+// because `AppleUSBCDC` exclusively claims the CDC ones.
 
-/// Bulk OUT endpoint (host → device).
+#[cfg(not(target_os = "macos"))]
 pub const EP_OUT_ADDR: u8 = 0x02;
-/// Bulk IN endpoint (device → host).
+#[cfg(not(target_os = "macos"))]
 pub const EP_IN_ADDR: u8 = 0x82;
+
+#[cfg(target_os = "macos")]
+pub const EP_OUT_ADDR: u8 = 0x04;
+#[cfg(target_os = "macos")]
+pub const EP_IN_ADDR: u8 = 0x84;
 
 // ── Buffer sizes ─────────────────────────────────────────────────────────────
 

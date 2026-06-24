@@ -60,40 +60,96 @@ pub(crate) mod usb {
         /// Open and configure the USBSID-Pico via libusb.
         pub fn open() -> Result<Self> {
             let ctx = Context::new().map_err(UsbSidError::Usb)?;
-            let handle = ctx.open_device_with_vid_pid(VENDOR_ID, PRODUCT_ID).ok_or(
-                UsbSidError::DeviceNotFound {
-                    vid: VENDOR_ID,
-                    pid: PRODUCT_ID,
-                },
-            )?;
 
-            // Detach kernel driver & claim interfaces
-            for if_num in 0..2u8 {
-                #[cfg(target_os = "linux")]
-                {
-                    if handle.kernel_driver_active(if_num).unwrap_or(false) {
-                        let _ = handle.detach_kernel_driver(if_num);
+            // Debug-only enumeration dump. RUST_LOG=usbsid_pico=debug to see.
+            match ctx.devices() {
+                Ok(list) => {
+                    log::debug!("libusb sees {} device(s)", list.len());
+                    for dev in list.iter() {
+                        if let Ok(d) = dev.device_descriptor() {
+                            log::debug!(
+                                "  bus={:03} addr={:03}  VID={:04X} PID={:04X}",
+                                dev.bus_number(),
+                                dev.address(),
+                                d.vendor_id(),
+                                d.product_id()
+                            );
+                        }
                     }
                 }
-                #[cfg(target_os = "macos")]
-                {
-                    let _ = handle.set_auto_detach_kernel_driver(true);
-                }
-                handle.claim_interface(if_num)?;
+                Err(e) => log::debug!("libusb device enumeration failed: {e}"),
             }
 
-            // Set line state (DTR | RTS)
-            handle.write_control(
-                0x21,
-                0x22,
-                ACM_CTRL_DTR | ACM_CTRL_RTS,
-                0,
-                &[],
-                Duration::from_secs(1),
-            )?;
+            // Iterate devices manually instead of `open_device_with_vid_pid`,
+            // which swallows the open() error and returns None — making
+            // permission/busy errors indistinguishable from "not present".
+            let devices = ctx.devices().map_err(UsbSidError::Usb)?;
+            let mut handle: Option<DeviceHandle<Context>> = None;
+            let mut last_open_err: Option<rusb::Error> = None;
+            for dev in devices.iter() {
+                let desc = match dev.device_descriptor() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if desc.vendor_id() != VENDOR_ID || desc.product_id() != PRODUCT_ID {
+                    continue;
+                }
+                match dev.open() {
+                    Ok(h) => {
+                        handle = Some(h);
+                        break;
+                    }
+                    Err(e) => last_open_err = Some(e),
+                }
+            }
+            let handle = match handle {
+                Some(h) => h,
+                None => {
+                    return Err(match last_open_err {
+                        Some(e) => UsbSidError::Usb(e),
+                        None => UsbSidError::DeviceNotFound {
+                            vid: VENDOR_ID,
+                            pid: PRODUCT_ID,
+                        },
+                    });
+                }
+            };
 
-            // Set line encoding (baud rate — ignored by TinyUSB but required by spec)
-            handle.write_control(0x21, 0x20, 0, 0, &LINE_ENCODING, Duration::from_secs(1))?;
+            // macOS: claim the vendor interface (4) because AppleUSBCDC
+            // exclusively owns the CDC interfaces (0/1). The control
+            // transfer is a WebUSB-style "connect" handshake — the
+            // firmware's tud_vendor_rx_cb drops every byte until
+            // web_serial_connected is true.
+            #[cfg(target_os = "macos")]
+            {
+                handle.claim_interface(4)?;
+                let _ = handle.set_alternate_setting(4, 0);
+                handle.write_control(0x21, 0x22, 0x01, 4, &[], Duration::from_secs(1))?;
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                for if_num in 0..2u8 {
+                    #[cfg(target_os = "linux")]
+                    {
+                        if handle.kernel_driver_active(if_num).unwrap_or(false) {
+                            let _ = handle.detach_kernel_driver(if_num);
+                        }
+                    }
+                    handle.claim_interface(if_num)?;
+                }
+                // CDC SET_CONTROL_LINE_STATE (DTR | RTS)
+                handle.write_control(
+                    0x21,
+                    0x22,
+                    ACM_CTRL_DTR | ACM_CTRL_RTS,
+                    0,
+                    &[],
+                    Duration::from_secs(1),
+                )?;
+                // CDC SET_LINE_CODING (baud ignored by TinyUSB, required by spec)
+                handle.write_control(0x21, 0x20, 0, 0, &LINE_ENCODING, Duration::from_secs(1))?;
+            }
 
             Ok(Self { handle, ctx })
         }
