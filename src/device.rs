@@ -39,6 +39,23 @@ struct SharedState {
     flush_done: bool,
 }
 
+/// Bundle of shared state handed to the writer thread. Exists so the
+/// thread entry-points don't blow past clippy's 7-argument threshold and
+/// so adding a new field doesn't ripple through every call site.
+struct WriterCtx {
+    run: Arc<AtomicBool>,
+    ring: Arc<RingBuffer>,
+    shared: Arc<Mutex<SharedState>>,
+    cond: Arc<Condvar>,
+    transport: Arc<Mutex<Box<dyn Transport>>>,
+    writer_errors: Arc<AtomicU64>,
+    with_cycles: bool,
+    /// Only consumed by the Linux/Windows writer path. macOS uses a fixed
+    /// 64-byte mega-send buffer regardless, so the field is unread there.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    len_out: usize,
+}
+
 // ── Main driver ──────────────────────────────────────────────────────────────
 
 /// Handle to a single USBSID-Pico device.
@@ -993,16 +1010,16 @@ impl UsbSid {
         let join = thread::Builder::new()
             .name("USBSID Thread".into())
             .spawn(move || {
-                Self::writer_thread(
-                    run_flag,
+                Self::writer_thread(WriterCtx {
+                    run: run_flag,
                     ring,
                     shared,
                     cond,
-                    with_cycles,
                     transport,
                     writer_errors,
+                    with_cycles,
                     len_out,
-                );
+                });
                 thread_count.fetch_sub(1, Ordering::SeqCst);
             })
             .map_err(|e| UsbSidError::Thread(e.to_string()))?;
@@ -1046,53 +1063,27 @@ impl UsbSid {
     ///
     /// On Linux/Windows, uses the original direct-send path (USB bulk
     /// transfers complete in sub-millisecond, no pipelining needed).
-    fn writer_thread(
-        run: Arc<AtomicBool>,
-        ring: Arc<RingBuffer>,
-        shared: Arc<Mutex<SharedState>>,
-        cond: Arc<Condvar>,
-        with_cycles: bool,
-        transport: Arc<Mutex<Box<dyn Transport>>>,
-        writer_errors: Arc<AtomicU64>,
-        len_out: usize,
-    ) {
+    fn writer_thread(ctx: WriterCtx) {
         #[cfg(target_os = "macos")]
-        Self::writer_thread_macos(
-            run,
-            ring,
-            shared,
-            cond,
-            with_cycles,
-            transport,
-            writer_errors,
-            len_out,
-        );
+        Self::writer_thread_macos(ctx);
 
         #[cfg(not(target_os = "macos"))]
-        Self::writer_thread_default(
-            run,
-            ring,
-            shared,
-            cond,
-            with_cycles,
-            transport,
-            writer_errors,
-            len_out,
-        );
+        Self::writer_thread_default(ctx);
     }
 
     /// macOS writer: async USB I/O thread + mega-send (64-byte aligned packets).
     #[cfg(target_os = "macos")]
-    fn writer_thread_macos(
-        run: Arc<AtomicBool>,
-        ring: Arc<RingBuffer>,
-        shared: Arc<Mutex<SharedState>>,
-        cond: Arc<Condvar>,
-        with_cycles: bool,
-        transport: Arc<Mutex<Box<dyn Transport>>>,
-        writer_errors: Arc<AtomicU64>,
-        _len_out: usize,
-    ) {
+    fn writer_thread_macos(ctx: WriterCtx) {
+        let WriterCtx {
+            run,
+            ring,
+            shared,
+            cond,
+            transport,
+            writer_errors,
+            with_cycles,
+            len_out: _,
+        } = ctx;
         debug!("[USBSID] Writer thread starting (macOS async path)");
 
         // Use a regular (unbounded) channel so the writer thread never blocks
@@ -1125,7 +1116,7 @@ impl UsbSid {
             .ok();
 
         let mut buffer_pos: usize = 1;
-        let mut thread_buf = vec![0u8; 64];
+        let mut thread_buf = [0u8; 64];
 
         while run.load(Ordering::SeqCst) {
             // Check flush flag (brief lock) and ring state (lock-free).
@@ -1256,16 +1247,17 @@ impl UsbSid {
 
     /// Linux/Windows writer: direct-send path with lock-free ring access.
     #[cfg(not(target_os = "macos"))]
-    fn writer_thread_default(
-        run: Arc<AtomicBool>,
-        ring: Arc<RingBuffer>,
-        shared: Arc<Mutex<SharedState>>,
-        cond: Arc<Condvar>,
-        with_cycles: bool,
-        transport: Arc<Mutex<Box<dyn Transport>>>,
-        writer_errors: Arc<AtomicU64>,
-        len_out: usize,
-    ) {
+    fn writer_thread_default(ctx: WriterCtx) {
+        let WriterCtx {
+            run,
+            ring,
+            shared,
+            cond,
+            transport,
+            writer_errors,
+            with_cycles,
+            len_out,
+        } = ctx;
         debug!("[USBSID] Thread starting");
         let mut thread_buf = vec![0u8; len_out];
         let mut out_buf = vec![0u8; len_out];
