@@ -18,8 +18,8 @@ use crate::constants::{DEFAULT_DIFF_SIZE, DEFAULT_RING_SIZE, MIN_DIFF_SIZE, MIN_
 
 /// A byte-level SPSC ring buffer with lock-free put/get.
 ///
-/// The producer calls [`put`] without any external lock.
-/// The consumer calls [`get`] without any external lock.
+/// The producer calls [`Self::put`] without any external lock.
+/// The consumer calls [`Self::get`] without any external lock.
 /// Safety relies on single-producer / single-consumer discipline.
 pub struct RingBuffer {
     /// Backing storage — UnsafeCell allows mutation from &self.
