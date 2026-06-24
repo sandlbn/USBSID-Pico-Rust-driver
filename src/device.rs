@@ -15,7 +15,7 @@
 //!    it and submits USB transfers (the `write_ring*` family).
 //!
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 #[cfg(target_os = "macos")]
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -75,6 +75,13 @@ pub struct UsbSid {
     cond: Arc<Condvar>,
     thread_handle: Option<JoinHandle<()>>,
     thread_count: Arc<AtomicI32>,
+    /// Cumulative count of `Transport::send` errors observed by the
+    /// background writer thread. The writer doesn't propagate these
+    /// (it logs + retries once + carries on so audible glitches are
+    /// minimised), but a host wanting to detect cable-yank / device-lost
+    /// can poll [`writer_error_count`](Self::writer_error_count) and
+    /// react when the counter grows.
+    writer_errors: Arc<AtomicU64>,
 
     // ── Clock / timing ───────────────────────────────────────────────────
     cycles_per_sec: i64,
@@ -130,6 +137,7 @@ impl UsbSid {
             cond: Arc::new(Condvar::new()),
             thread_handle: None,
             thread_count: Arc::new(AtomicI32::new(0)),
+            writer_errors: Arc::new(AtomicU64::new(0)),
 
             cycles_per_sec: ClockSpeed::Default as i64,
             cycles_per_frame: RefreshRate::Default as i64,
@@ -256,6 +264,20 @@ impl UsbSid {
     /// `true` if the USB port is currently open and ready for I/O.
     pub fn is_open(&self) -> bool {
         self.port_is_open
+    }
+
+    /// Cumulative number of `Transport::send` failures the background
+    /// writer thread has logged since `init()`. The writer recovers from
+    /// most transient errors by retrying once and carries on, but a
+    /// rapid growth in this counter is the cheapest reliable signal that
+    /// the device is gone (cable yanked, USB controller reset, etc.).
+    ///
+    /// Atomic load — safe to call from any thread, no locking, no I/O.
+    /// Hosts that need a "device alive" indicator should poll this
+    /// roughly per playback frame (~20 ms) and trigger reconnect /
+    /// process restart when it grows.
+    pub fn writer_error_count(&self) -> u64 {
+        self.writer_errors.load(Ordering::Relaxed)
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -965,6 +987,7 @@ impl UsbSid {
         let cond = Arc::clone(&self.cond);
         let with_cycles = self.with_cycles;
         let thread_count = Arc::clone(&self.thread_count);
+        let writer_errors = Arc::clone(&self.writer_errors);
         let len_out = self.len_out_buffer;
 
         let join = thread::Builder::new()
@@ -977,6 +1000,7 @@ impl UsbSid {
                     cond,
                     with_cycles,
                     transport,
+                    writer_errors,
                     len_out,
                 );
                 thread_count.fetch_sub(1, Ordering::SeqCst);
@@ -1029,13 +1053,32 @@ impl UsbSid {
         cond: Arc<Condvar>,
         with_cycles: bool,
         transport: Arc<Mutex<Box<dyn Transport>>>,
+        writer_errors: Arc<AtomicU64>,
         len_out: usize,
     ) {
         #[cfg(target_os = "macos")]
-        Self::writer_thread_macos(run, ring, shared, cond, with_cycles, transport, len_out);
+        Self::writer_thread_macos(
+            run,
+            ring,
+            shared,
+            cond,
+            with_cycles,
+            transport,
+            writer_errors,
+            len_out,
+        );
 
         #[cfg(not(target_os = "macos"))]
-        Self::writer_thread_default(run, ring, shared, cond, with_cycles, transport, len_out);
+        Self::writer_thread_default(
+            run,
+            ring,
+            shared,
+            cond,
+            with_cycles,
+            transport,
+            writer_errors,
+            len_out,
+        );
     }
 
     /// macOS writer: async USB I/O thread + mega-send (64-byte aligned packets).
@@ -1047,6 +1090,7 @@ impl UsbSid {
         cond: Arc<Condvar>,
         with_cycles: bool,
         transport: Arc<Mutex<Box<dyn Transport>>>,
+        writer_errors: Arc<AtomicU64>,
         _len_out: usize,
     ) {
         debug!("[USBSID] Writer thread starting (macOS async path)");
@@ -1057,6 +1101,7 @@ impl UsbSid {
         let (usb_tx, usb_rx) = mpsc::channel::<Vec<u8>>();
         let io_transport = Arc::clone(&transport);
         let io_run = Arc::clone(&run);
+        let io_errors = Arc::clone(&writer_errors);
 
         let io_thread = thread::Builder::new()
             .name("USBSID USB-IO".into())
@@ -1067,8 +1112,12 @@ impl UsbSid {
                     }
                     if let Ok(mut t) = io_transport.lock() {
                         if let Err(e) = t.send(&buf) {
+                            io_errors.fetch_add(1, Ordering::Relaxed);
                             eprintln!("[USBSID-IO] USB send failed: {e}, retrying");
-                            let _ = t.send(&buf);
+                            if let Err(e2) = t.send(&buf) {
+                                io_errors.fetch_add(1, Ordering::Relaxed);
+                                eprintln!("[USBSID-IO] USB send retry also failed: {e2}");
+                            }
                         }
                     }
                 }
@@ -1214,6 +1263,7 @@ impl UsbSid {
         cond: Arc<Condvar>,
         with_cycles: bool,
         transport: Arc<Mutex<Box<dyn Transport>>>,
+        writer_errors: Arc<AtomicU64>,
         len_out: usize,
     ) {
         debug!("[USBSID] Thread starting");
@@ -1260,8 +1310,12 @@ impl UsbSid {
                     thread_buf.fill(0);
                     if let Ok(mut t) = transport.lock() {
                         if let Err(e) = t.send(&out_buf[..send_len]) {
+                            writer_errors.fetch_add(1, Ordering::Relaxed);
                             warn!("[USBSID] USB send failed (pre-flush): {e}, retrying");
-                            let _ = t.send(&out_buf[..send_len]);
+                            if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                writer_errors.fetch_add(1, Ordering::Relaxed);
+                                warn!("[USBSID] USB send retry also failed (pre-flush): {e2}");
+                            }
                         }
                     }
                     out_buf.fill(0);
@@ -1291,8 +1345,14 @@ impl UsbSid {
                         buffer_pos = 1;
                         if let Ok(mut t) = transport.lock() {
                             if let Err(e) = t.send(&out_buf[..send_len]) {
+                                writer_errors.fetch_add(1, Ordering::Relaxed);
                                 warn!("[USBSID] USB send failed (cycled drain): {e}, retrying");
-                                let _ = t.send(&out_buf[..send_len]);
+                                if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                    writer_errors.fetch_add(1, Ordering::Relaxed);
+                                    warn!(
+                                        "[USBSID] USB send retry also failed (cycled drain): {e2}"
+                                    );
+                                }
                             }
                         }
                         thread_buf.fill(0);
@@ -1311,8 +1371,12 @@ impl UsbSid {
                         buffer_pos = 1;
                         if let Ok(mut t) = transport.lock() {
                             if let Err(e) = t.send(&out_buf[..send_len]) {
+                                writer_errors.fetch_add(1, Ordering::Relaxed);
                                 warn!("[USBSID] USB send failed (drain): {e}, retrying");
-                                let _ = t.send(&out_buf[..send_len]);
+                                if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                    writer_errors.fetch_add(1, Ordering::Relaxed);
+                                    warn!("[USBSID] USB send retry also failed (drain): {e2}");
+                                }
                             }
                         }
                         thread_buf.fill(0);
@@ -1336,8 +1400,12 @@ impl UsbSid {
                     thread_buf.fill(0);
                     if let Ok(mut t) = transport.lock() {
                         if let Err(e) = t.send(&out_buf[..send_len]) {
+                            writer_errors.fetch_add(1, Ordering::Relaxed);
                             warn!("[USBSID] USB send failed (post-flush): {e}, retrying");
-                            let _ = t.send(&out_buf[..send_len]);
+                            if let Err(e2) = t.send(&out_buf[..send_len]) {
+                                writer_errors.fetch_add(1, Ordering::Relaxed);
+                                warn!("[USBSID] USB send retry also failed (post-flush): {e2}");
+                            }
                         }
                     }
                     out_buf.fill(0);
