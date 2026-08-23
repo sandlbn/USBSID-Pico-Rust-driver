@@ -38,6 +38,10 @@ pub(crate) trait Transport: Send {
     fn recv_timeout(&mut self, buf: &mut [u8], _timeout_ms: u32) -> Result<usize> {
         self.recv(buf)
     }
+
+    /// Clear a halted IN endpoint. Default is a no-op — only the libusb
+    /// backend can actually issue a USB CLEAR_HALT.
+    fn clear_in_halt(&mut self) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +176,10 @@ pub(crate) mod usb {
             self.handle
                 .read_bulk(EP_IN_ADDR, buf, Duration::from_millis(timeout_ms as u64))
                 .map_err(UsbSidError::Usb)
+        }
+
+        fn clear_in_halt(&mut self) {
+            let _ = self.handle.clear_halt(EP_IN_ADDR);
         }
     }
 }

@@ -325,6 +325,19 @@ impl UsbSid {
         self.sync_time();
     }
 
+    /// Clear a halted IN endpoint. Call after a `Pipe error` on
+    /// `recv_raw` to un-stall the endpoint. No-op on serial backend.
+    pub fn clear_in_halt(&self) {
+        if !self.port_is_open {
+            return;
+        }
+        if let Some(ref t) = self.transport {
+            if let Ok(mut guard) = t.lock() {
+                guard.clear_in_halt();
+            }
+        }
+    }
+
     /// Reset every register on all SID chips.
     pub fn reset_all_registers(&mut self) {
         if !self.port_is_open {
@@ -627,12 +640,19 @@ impl UsbSid {
         }
     }
 
-    /// Internal helper: send a config command and read back `len` bytes, returning the first byte.
+    /// Internal helper: send a config command and read back the first byte.
+    ///
+    /// `len` is the caller's intent — but firmware ≥ 0.7.7 sometimes emits
+    /// more bytes than the historical 1-byte reply, and asking libusb for
+    /// only 1 byte returns [`rusb::Error::Overflow`] and halts the IN
+    /// endpoint. We always allocate a full-size buffer so any legal
+    /// reply fits, then use `buf[0]` as before.
     fn single_read_config(&self, len: usize) -> u8 {
         if !self.port_is_open {
             return 0;
         }
-        let mut buf = vec![0u8; len];
+        let cap = len.max(64);
+        let mut buf = vec![0u8; cap];
         match self.recv_bytes(&mut buf) {
             Ok(_) => buf[0],
             Err(e) => {
