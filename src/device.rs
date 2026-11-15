@@ -37,6 +37,11 @@ struct SharedState {
     flush: bool,
     /// Set to `true` by the writer thread after a flush has been fully drained.
     flush_done: bool,
+    /// Set by `discard_pending`: the writer thread drops everything queued
+    /// (ring + partial packet) instead of sending it.
+    discard: bool,
+    /// Set by the writer thread once a discard request has been applied.
+    discard_done: bool,
 }
 
 /// Bundle of shared state handed to the writer thread. Exists so the
@@ -49,6 +54,11 @@ struct WriterCtx {
     cond: Arc<Condvar>,
     transport: Arc<Mutex<Box<dyn Transport>>>,
     writer_errors: Arc<AtomicU64>,
+    /// Bumped by `discard_pending`; USB buffers queued under an older epoch
+    /// are dropped by the macOS IO thread instead of being sent. The
+    /// Linux/Windows writer sends synchronously, so nothing is queued there.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    epoch: Arc<AtomicU64>,
     with_cycles: bool,
     /// Only consumed by the Linux/Windows writer path. macOS uses a fixed
     /// 64-byte mega-send buffer regardless, so the field is unread there.
@@ -99,6 +109,7 @@ pub struct UsbSid {
     /// can poll [`writer_error_count`](Self::writer_error_count) and
     /// react when the counter grows.
     writer_errors: Arc<AtomicU64>,
+    epoch: Arc<AtomicU64>,
 
     // ── Clock / timing ───────────────────────────────────────────────────
     cycles_per_sec: i64,
@@ -150,11 +161,14 @@ impl UsbSid {
             shared: Arc::new(Mutex::new(SharedState {
                 flush: false,
                 flush_done: false,
+                discard: false,
+                discard_done: false,
             })),
             cond: Arc::new(Condvar::new()),
             thread_handle: None,
             thread_count: Arc::new(AtomicI32::new(0)),
             writer_errors: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(AtomicU64::new(0)),
 
             cycles_per_sec: ClockSpeed::Default as i64,
             cycles_per_frame: RefreshRate::Default as i64,
@@ -514,7 +528,7 @@ impl UsbSid {
         self.pcb_version
     }
 
-    /// Set the device to mono (0) or stereo (1) – v1.3 PCB only.
+    /// Set the device to mono (0) or stereo (1) – PCB v1.3 and newer (audio switch).
     pub fn set_stereo(&mut self, state: i32) {
         if !self.port_is_open {
             return;
@@ -522,13 +536,13 @@ impl UsbSid {
         if self.pcb_version == -1 {
             self.get_pcb_version();
         }
-        if self.pcb_version == 13 {
+        if self.pcb_version >= 13 {
             let buf = [command_byte(CMD_CONFIG), 0x89, state as u8, 0, 0, 0];
             let _ = self.single_write(&buf);
         }
     }
 
-    /// Toggle between mono and stereo – v1.3 PCB only.
+    /// Toggle between mono and stereo – PCB v1.3 and newer (audio switch).
     pub fn toggle_stereo(&mut self) {
         if !self.port_is_open {
             return;
@@ -536,7 +550,7 @@ impl UsbSid {
         if self.pcb_version == -1 {
             self.get_pcb_version();
         }
-        if self.pcb_version == 13 {
+        if self.pcb_version >= 13 {
             let buf = [command_byte(CMD_CONFIG), 0x88, 0, 0, 0, 0];
             let _ = self.single_write(&buf);
         }
@@ -838,6 +852,44 @@ impl UsbSid {
         self.stop_thread();
     }
 
+    /// Drop every write that is queued but not yet on the wire: the ring,
+    /// the writer's partial packet and (macOS) USB buffers waiting for the
+    /// I/O thread. Blocks up to 100 ms for the writer to apply it. Call this
+    /// before `mute`/`reset` on stop or tune change, so stale writes can't
+    /// land after the mute and re-trigger voices (or un-mute via $D418).
+    /// The producer must not push writes concurrently.
+    pub fn discard_pending(&mut self) {
+        if !self.port_is_open || !self.threaded {
+            return;
+        }
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut s) = self.shared.lock() {
+            s.discard = true;
+            s.discard_done = false;
+            s.flush = false;
+            self.cond.notify_all();
+            let _ = self
+                .cond
+                .wait_timeout_while(s, Duration::from_millis(100), |s| !s.discard_done);
+        }
+        self.sync_time();
+    }
+
+    /// Writer-thread side of [`discard_pending`]. Returns true when a discard
+    /// was applied (the caller then resets its partial packet).
+    fn apply_discard(shared: &Mutex<SharedState>, cond: &Condvar, ring: &RingBuffer) -> bool {
+        let mut s = shared.lock().unwrap();
+        if !s.discard {
+            return false;
+        }
+        ring.reset();
+        s.discard = false;
+        s.discard_done = true;
+        s.flush_done = true;
+        cond.notify_all();
+        true
+    }
+
     /// Signal that the ring-buffer should be flushed.
     pub fn set_flush(&mut self) {
         self.sync_time();
@@ -1025,6 +1077,7 @@ impl UsbSid {
         let with_cycles = self.with_cycles;
         let thread_count = Arc::clone(&self.thread_count);
         let writer_errors = Arc::clone(&self.writer_errors);
+        let epoch = Arc::clone(&self.epoch);
         let len_out = self.len_out_buffer;
 
         let join = thread::Builder::new()
@@ -1037,6 +1090,7 @@ impl UsbSid {
                     cond,
                     transport,
                     writer_errors,
+                    epoch,
                     with_cycles,
                     len_out,
                 });
@@ -1101,15 +1155,18 @@ impl UsbSid {
             cond,
             transport,
             writer_errors,
+            epoch,
             with_cycles,
             len_out: _,
         } = ctx;
         debug!("[USBSID] Writer thread starting (macOS async path)");
 
-        // Use a regular (unbounded) channel so the writer thread never blocks
-        // waiting for the USB I/O thread to finish.  The C++ driver uses async
-        // libusb transfers which are non-blocking — this matches that behavior.
-        let (usb_tx, usb_rx) = mpsc::channel::<Vec<u8>>();
+        // Unbounded channel so the writer thread never blocks waiting for the
+        // USB I/O thread (a bounded one stalls ring draining on write-heavy
+        // tunes and overflows the ring). Buffers are tagged with the discard
+        // epoch so `discard_pending` can drop what is still queued here.
+        let (usb_tx, usb_rx) = mpsc::channel::<(u64, Vec<u8>)>();
+        let io_epoch = Arc::clone(&epoch);
         let io_transport = Arc::clone(&transport);
         let io_run = Arc::clone(&run);
         let io_errors = Arc::clone(&writer_errors);
@@ -1117,9 +1174,12 @@ impl UsbSid {
         let io_thread = thread::Builder::new()
             .name("USBSID USB-IO".into())
             .spawn(move || {
-                while let Ok(buf) = usb_rx.recv() {
+                while let Ok((tag, buf)) = usb_rx.recv() {
                     if !io_run.load(Ordering::SeqCst) {
                         break;
+                    }
+                    if tag != io_epoch.load(Ordering::SeqCst) {
+                        continue; // discarded by discard_pending()
                     }
                     if let Ok(mut t) = io_transport.lock() {
                         if let Err(e) = t.send(&buf) {
@@ -1142,7 +1202,7 @@ impl UsbSid {
             // Check flush flag (brief lock) and ring state (lock-free).
             let flushing = {
                 let mut locked = shared.lock().unwrap();
-                if !locked.flush && !ring.has_data() {
+                if !locked.flush && !locked.discard && !ring.has_data() {
                     if ring.is_empty() {
                         locked = cond
                             .wait_timeout(locked, Duration::from_millis(1))
@@ -1161,6 +1221,12 @@ impl UsbSid {
                 }
                 f
             }; // mutex released here
+
+            if Self::apply_discard(&shared, &cond, &ring) {
+                buffer_pos = 1;
+                thread_buf.fill(0);
+                continue;
+            }
 
             if flushing {
                 let ring_pending = ring.diff();
@@ -1213,7 +1279,7 @@ impl UsbSid {
                 }
 
                 if !mega_buf.is_empty() {
-                    let _ = usb_tx.send(mega_buf);
+                    let _ = usb_tx.send((epoch.load(Ordering::SeqCst), mega_buf));
                 }
                 buffer_pos = 1;
 
@@ -1237,7 +1303,7 @@ impl UsbSid {
                             thread_buf[0] = cycled_write_header((buffer_pos - 1) as u8);
                             let mut pkt = [0u8; 64];
                             pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                            let _ = usb_tx.send(pkt.to_vec());
+                            let _ = usb_tx.send((epoch.load(Ordering::SeqCst), pkt.to_vec()));
                             thread_buf.fill(0);
                             buffer_pos = 1;
                         }
@@ -1250,7 +1316,7 @@ impl UsbSid {
                             thread_buf[0] = write_header((buffer_pos - 1) as u8);
                             let mut pkt = [0u8; 64];
                             pkt[..buffer_pos].copy_from_slice(&thread_buf[..buffer_pos]);
-                            let _ = usb_tx.send(pkt.to_vec());
+                            let _ = usb_tx.send((epoch.load(Ordering::SeqCst), pkt.to_vec()));
                             thread_buf.fill(0);
                             buffer_pos = 1;
                         }
@@ -1275,6 +1341,7 @@ impl UsbSid {
             cond,
             transport,
             writer_errors,
+            epoch: _,
             with_cycles,
             len_out,
         } = ctx;
@@ -1287,7 +1354,7 @@ impl UsbSid {
             // Check flush flag (brief lock) and ring state (lock-free).
             let flushing = {
                 let mut locked = shared.lock().unwrap();
-                if !locked.flush && !ring.has_data() {
+                if !locked.flush && !locked.discard && !ring.has_data() {
                     if ring.is_empty() {
                         locked = cond
                             .wait_timeout(locked, Duration::from_millis(1))
@@ -1306,6 +1373,12 @@ impl UsbSid {
                 }
                 f
             }; // mutex released here
+
+            if Self::apply_discard(&shared, &cond, &ring) {
+                buffer_pos = 1;
+                thread_buf.fill(0);
+                continue;
+            }
 
             if flushing {
                 // Pre-flush: send any partial packet from thread_buf.
