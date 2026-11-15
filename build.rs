@@ -19,14 +19,19 @@ fn main() {
     // `rusb` already links libusb via its own build script, but if you
     // build this crate as a cdylib/staticlib for C consumers you may need
     // pthread explicitly on Linux, or framework links on macOS.
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=pthread");
+    // Build scripts run on the HOST, so `#[cfg(target_os)]` would describe
+    // the build machine, not the target (breaks cross-compiling, e.g. a
+    // Windows build on macOS). Use the target triple Cargo passes instead.
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    if target_os == "linux" {
+        println!("cargo:rustc-link-lib=pthread");
+    }
 
     // On macOS, libusb depends on IOKit and CoreFoundation frameworks.
     // rusb's build script handles this, but if linking as a static lib
     // for C consumers these may be needed.
-    #[cfg(target_os = "macos")]
-    {
+    if target_os == "macos" {
         println!("cargo:rustc-link-lib=framework=IOKit");
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=Security");
